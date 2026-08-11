@@ -16,3 +16,5 @@ eval_local.py
 lightning_logs/*
 launch_sh
 launch_sh/*.sh
+docs/
+.superpowers/

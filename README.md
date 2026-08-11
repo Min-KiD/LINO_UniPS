@@ -55,6 +55,7 @@ conda activate LINO
 pip install -r requirements.txt
 ```
 
+
 ### 📝 Dataset Preparation
 Download the following benchmarks for evaluate our LiNO-UniPS.
 * [DiLiGenT](https://drive.google.com/open?id=1EgC3x8daOWL4uQmc6c4nXVe4mdAMJVfg): A widely-used benchmark for photometric stereo, consisting of 10 real-world objects with diverse shapes and materials under precisely calibrated directional lighting.
@@ -95,6 +96,99 @@ python eval.py --task_name DIR --data_root data/DIR_pms/ --num_images 64
 The evaluation results will be stored in the output directory.
 
 Note for DiLiGenT10²: The ground truth normals for this benchmark are withheld for official evaluation. To get your score, you must submit the predicted results, which are saved in `.mat` format inside the `submit` directory, to the [official evaluation server](https://lab.ybh1998.space:8443/psbenchmarkwebsite/).
+
+### 🔬 SDM-EXR paired comparison
+
+The single preset [`configs/sdm_exr_infer.yaml`](configs/sdm_exr_infer.yaml)
+expects one directory per object beneath `/mnt/18TData/minhnv/test`, with
+at least 16 three-channel `image*.exr` observations, a signed
+`local_normal.exr`, and (for the default `external` policy) an aligned
+`binary_mask.exr`:
+
+```text
+test/
+  object_a.data/
+    image01.exr ... image16.exr
+    binary_mask.exr
+    local_normal.exr
+```
+
+Run the four comparison stages below. Replace the local checkpoint and SDM
+paths with your released assets. `prepare-view` does not launch inference: it
+creates a fresh per-request SDM output directory, then prints both the SDM
+command and the required `finalize-sdm` command.
+
+```bash
+# 1. Run released-checkpoint LINO inference.
+python eval.py --config configs/sdm_exr_infer.yaml
+
+# 2. Prepare a ground-truth-hidden SDM view and print the exact SDM command.
+python compare_sdm.py prepare-view \
+  --config configs/sdm_exr_infer.yaml \
+  --sdm-repo /path/to/PhotometricStereo \
+  --sdm-checkpoint /path/to/optimized_sdm.pt \
+  --sdm-python /path/to/sdm/environment/bin/python
+
+# 3. Run the printed SDM command in the SDM environment, then run the printed
+#    finalize-sdm command in the LINO environment. It validates and seals the
+#    exact prediction EXRs for that request.
+
+# 4. Score with the exact request path printed in the finalize command.
+python compare_sdm.py score \
+  --config configs/sdm_exr_infer.yaml \
+  --request output/sdm_lino_comparison/<policy>/sdm_requests/<request-id>.json
+```
+
+`mask_policy: external` and `mask_policy: full` are two input protocols in
+the same YAML: external supplies `binary_mask.exr`, while full supplies
+all-ones input and links no mask. These masks affect model preprocessing and
+prediction support only. Scoring instead derives one common validity mask
+from the finite, non-negligible vectors in the source `local_normal.exr` and
+uses it for both predictions. Ordinary SDM `full` with ground truth still
+visible is not strict mask-free evaluation; the generated view hides
+`local_normal.exr` (and omits the external mask for `full`) from SDM.
+
+The first seeded run writes the exact ordered-light manifest under the policy
+output. For a later pinned/repeated run, edit this same YAML (do not create a
+second policy YAML) to set `light_selection: manifest` and point
+`selection_manifest` at that generated file; the policy alias
+`output/sdm_lino_comparison/<policy>/selected_lights.json` is accepted. Reuse
+that exact manifest for both LINO and SDM before scoring.
+
+Raw observations and the selected input mask are shared by both runners, but
+model-specific runtime knobs remain native: this YAML's `pixel_samples` is a
+LINO decoder chunk setting, while SDM reads its separate value from
+`baseline_optimized_infer.yaml`.
+
+The authoritative artifacts are signed source-resolution EXRs:
+`<policy>/lino/<object>.data/normal_pred.exr` from LINO and
+`<policy>/sdm/<request-id>/<object_stem>_pred.exr` from SDM. PNGs are previews
+only; the score command never reads them. Each preparation records the exact
+config, source/selection manifests, SDM command, checkpoint, optimized config,
+entry point, and Python executable hashes. Finalization rebuilds the source
+manifest, validates the complete output set and geometry, and records every
+prediction hash. Scoring requires that completion record and rejects a missing,
+stale, edited, symlinked, or otherwise mismatched run.
+
+Because the printed SDM command is still run manually, finalization cannot
+cryptographically prove which process produced the bytes; a person could
+deliberately copy other predictions into the fresh directory before sealing
+it. Its purpose is to prevent accidental reuse of an old output directory and
+to detect source, request, or prediction changes after preparation/finalization.
+Finalization and scoring re-open the descriptor-relative view and require the
+same exact object/basename/link set, source targets, source hashes, tree digest,
+and directory identities recorded at preparation. A transient manual edit that
+is completely removed before validation cannot be detected; the attestation
+proves the tree observed at each validation point, not an unobserved history.
+The comparison path does not change either model architecture and performs no
+training.
+
+Runtime requires the released local LINO checkpoint and installed project
+dependencies, plus a local SDM repository/checkpoint and its Python
+environment. The released checkpoint route requires CUDA with bf16; CPU
+fp32 is only the injected-test path. The comparison EXR code enables
+OpenCV's EXR switch before import (the OpenCV build must still include EXR
+support).
 
 
 
@@ -361,5 +455,3 @@ If you find this repository useful, please consider giving a star :star: and cit
       year={2025}
 }
 ```
-
-

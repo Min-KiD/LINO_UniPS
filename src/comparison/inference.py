@@ -1,0 +1,1032 @@
+"""CPU-testable released-checkpoint inference and provenance for LINO.
+
+The comparison runner intentionally keeps model construction behind a local
+import and accepts injected model/dataset factories.  This makes configuration
+and contract tests independent of Lightning, large checkpoints, and CUDA while
+leaving the released model implementation untouched.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import stat
+import tempfile
+import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from .config import SdmExrInferenceConfig
+from .exr_io import (
+    encode_normal_exr,
+    encode_normal_png,
+    read_file_bytes,
+)
+from .manifest import (
+    DatasetManifest,
+    build_dataset_manifest,
+    persist_comparison_manifests_at_fd,
+    stable_seed,
+)
+from .provenance import (
+    atomic_replace_bytes_at_fd,
+    config_runtime_fingerprint,
+    file_identity,
+    lino_preprocessing_snapshot,
+    sha256_bytes,
+)
+
+
+ModelLoader = Callable[[SdmExrInferenceConfig, torch.device], Any]
+DatasetFactory = Callable[[SdmExrInferenceConfig, DatasetManifest], Any]
+
+
+def _precision_dtype(config: SdmExrInferenceConfig) -> torch.dtype:
+    return {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[config.precision]
+
+
+def _resolve_device(config: SdmExrInferenceConfig) -> torch.device:
+    """Resolve ``auto`` and reject unsupported device/precision combinations."""
+
+    if config.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(config.device)
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was explicitly requested but is unavailable")
+    if device.type == "cpu" and config.precision != "fp32":
+        raise ValueError("CPU inference supports only fp32 precision")
+    # The released normal graph contains explicit bfloat16 conversions in its
+    # decoder.  A true CUDA fp32/fp16 route would therefore be misleading
+    # without architecture changes; keep the supported real path honest.
+    if device.type == "cuda" and config.precision != "bf16":
+        raise ValueError("released CUDA LINO inference requires bf16 precision")
+    if device.type not in {"cpu", "cuda"}:
+        raise ValueError(f"unsupported inference device: {device}")
+    return device
+
+
+def load_local_lino_checkpoint(
+    config: SdmExrInferenceConfig,
+    device: torch.device | str,
+    *,
+    checkpoint_bytes: bytes | None = None,
+) -> Any:
+    """Construct and strictly validate the released normal LINO checkpoint.
+
+    The normal model import is deliberately function-local.  Importing
+    ``src.models`` at module import time would pull optional Lightning and
+    TorchMetrics dependencies into configuration-only workflows.
+    """
+
+    resolved_device = torch.device(device)
+    if resolved_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was explicitly requested but is unavailable")
+    if resolved_device.type == "cpu" and config.precision != "fp32":
+        raise ValueError("CPU inference supports only fp32 precision")
+    if resolved_device.type != "cuda":
+        raise RuntimeError("released LINO checkpoint inference requires CUDA")
+    if config.precision != "bf16":
+        raise ValueError("released CUDA LINO inference requires bf16 precision")
+
+    checkpoint = Path(config.checkpoint)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"LINO checkpoint does not exist: {checkpoint}")
+
+    # Keep this import local and import only the released normal architecture;
+    # no PBR model, optimizer, trainer, or network-backed hub loader is used.
+    from src.models.Net_module import LiNo_UniPS
+
+    model = LiNo_UniPS(pixel_samples=config.pixel_samples, task_name="SDM_EXR")
+    raw = checkpoint_bytes
+    if raw is None:
+        raw = read_file_bytes(checkpoint, label="LINO checkpoint")
+    if not isinstance(raw, bytes) or not raw:
+        raise ValueError("LINO checkpoint snapshot must be nonempty bytes")
+    payload = torch.load(io.BytesIO(raw), weights_only=False, map_location="cpu")
+    state_dict = payload
+    if isinstance(payload, Mapping) and "state_dict" in payload:
+        state_dict = payload["state_dict"]
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("LINO checkpoint must contain a state-dict mapping")
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if isinstance(incompatible, Mapping):
+        missing = list(incompatible.get("missing_keys", ()))
+        unexpected = list(incompatible.get("unexpected_keys", ()))
+    elif isinstance(incompatible, tuple) and len(incompatible) == 2:
+        missing = list(incompatible[0])
+        unexpected = list(incompatible[1])
+    else:
+        missing = list(getattr(incompatible, "missing_keys", ()))
+        unexpected = list(getattr(incompatible, "unexpected_keys", ()))
+    if missing or unexpected:
+        raise RuntimeError(
+            "LINO checkpoint keys do not match the released architecture: "
+            f"missing_keys={missing!r}, unexpected_keys={unexpected!r}"
+        )
+
+    # Preserve checkpoint parameter storage precision.  Autocast in the
+    # inference loop controls operation precision without a permanent cast.
+    model.to(resolved_device)
+    model.eval()
+    return model
+
+
+def _default_dataset_factory(
+    config: SdmExrInferenceConfig,
+    manifest: DatasetManifest,
+) -> Any:
+    # Kept local to avoid importing data/model optional dependencies when this
+    # module is imported only for CLI parsing or checkpoint helper tests.
+    from src.data.sdm_exr_data import SdmExrDataset
+
+    return SdmExrDataset(config, manifest)
+
+
+def _atomic_json_write(path: str | Path, payload: Mapping[str, Any]) -> Path:
+    destination = path if isinstance(path, Path) else Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2, sort_keys=False, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+    except Exception:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    return destination
+
+
+def _secure_directory_flags() -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("secure LINO output requires O_DIRECTORY/O_NOFOLLOW")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_or_create_directory(path: Path, *, label: str) -> tuple[int, dict[str, int], Path]:
+    """Walk/create a directory tree using no-follow descriptor-relative calls."""
+
+    absolute = Path(os.path.abspath(str(path)))
+    parts = absolute.parts
+    if not parts or parts[0] != os.sep:
+        raise ValueError(f"{label} must resolve to an absolute path: {path}")
+    flags = _secure_directory_flags()
+    descriptor = os.open(os.sep, flags)
+    try:
+        for component in parts[1:]:
+            try:
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    raise ValueError(f"{label} appeared during secure creation: {absolute}")
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"{label} must contain only real directories: {absolute}")
+            expected = (int(info.st_dev), int(info.st_ino))
+            child_fd = os.open(component, flags, dir_fd=descriptor)
+            child_info = os.fstat(child_fd)
+            actual = (int(child_info.st_dev), int(child_info.st_ino))
+            if actual != expected:
+                os.close(child_fd)
+                raise ValueError(f"{label} was replaced during secure creation: {absolute}")
+            os.close(descriptor)
+            descriptor = child_fd
+        info = os.fstat(descriptor)
+        identity = {"dev": int(info.st_dev), "ino": int(info.st_ino)}
+        return descriptor, identity, absolute
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _open_or_create_child_directory(
+    parent_fd: int,
+    parent_path: Path,
+    name: str,
+    *,
+    label: str,
+) -> tuple[int, dict[str, int], Path]:
+    if not name or Path(name).name != name or name in {".", ".."} or "\\" in name:
+        raise ValueError(f"{label} name must be one safe path component")
+    flags = _secure_directory_flags()
+    child_fd: int | None = None
+    try:
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"{label} must be a real directory: {parent_path / name}")
+        expected = (int(info.st_dev), int(info.st_ino))
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+        child_info = os.fstat(child_fd)
+        actual = (int(child_info.st_dev), int(child_info.st_ino))
+        if actual != expected:
+            raise ValueError(f"{label} was replaced during secure creation: {parent_path / name}")
+        result = child_fd, {"dev": actual[0], "ino": actual[1]}, parent_path / name
+        child_fd = None
+        return result
+    except OSError as exc:
+        raise ValueError(f"failed to securely open {label}: {parent_path / name}") from exc
+    finally:
+        if child_fd is not None:
+            try:
+                os.close(child_fd)
+            except OSError:
+                pass
+
+
+def _write_bytes_at_fd(
+    directory_fd: int,
+    basename: str,
+    payload: bytes,
+    *,
+    expected_directory_identity: dict[str, int],
+    label: str,
+    directory_path: Path | None = None,
+) -> tuple[int, int]:
+    """Atomically publish an owned artifact through a pinned directory FD."""
+
+    return atomic_replace_bytes_at_fd(
+        directory_fd,
+        basename,
+        payload,
+        expected_directory_identity=expected_directory_identity,
+        label=label,
+        directory_path=directory_path,
+    )
+
+
+def _assert_directory_path_identity(
+    path: Path,
+    expected: dict[str, int],
+    *,
+    label: str,
+) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"{label} disappeared during publication: {path}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"{label} is not a real directory: {path}")
+    actual = {"dev": int(info.st_dev), "ino": int(info.st_ino)}
+    if actual != expected:
+        raise ValueError(f"{label} was replaced during publication: {path}")
+
+
+def _open_lino_output_tree(
+    config: SdmExrInferenceConfig,
+) -> tuple[int, dict[str, int], Path, int, dict[str, int], Path]:
+    """Open the policy/LINO tree and close the parent if child opening fails."""
+
+    policy_fd, policy_identity, policy_path = _open_or_create_directory(
+        config.policy_root,
+        label="LINO policy output directory",
+    )
+    try:
+        lino_fd, lino_identity, lino_path = _open_or_create_child_directory(
+            policy_fd,
+            policy_path,
+            "lino",
+            label="LINO output directory",
+        )
+    except Exception:
+        os.close(policy_fd)
+        raise
+    return (
+        policy_fd,
+        policy_identity,
+        policy_path,
+        lino_fd,
+        lino_identity,
+        lino_path,
+    )
+
+
+@contextlib.contextmanager
+def _pinned_lino_output_tree(config: SdmExrInferenceConfig):
+    tree = _open_lino_output_tree(config)
+    policy_fd, _, _, lino_fd, _, _ = tree
+    try:
+        yield tree
+    finally:
+        try:
+            os.close(lino_fd)
+        finally:
+            os.close(policy_fd)
+
+
+def _validate_lino_output_tree(
+    lino_fd: int,
+    manifest: DatasetManifest,
+    *,
+    save_png: bool,
+    require_all_objects: bool,
+    require_run: bool,
+    allow_run: bool = True,
+    expected_run_identity: tuple[int, int] | None = None,
+) -> None:
+    """Validate exact root/object artifact sets through the pinned LINO FD."""
+
+    if require_run and not allow_run:
+        raise ValueError("require_run and allow_run=False are incompatible")
+    if require_run and expected_run_identity is None:
+        raise ValueError("required LINO run provenance identity is missing")
+    if not require_run and expected_run_identity is not None:
+        raise ValueError("unexpected LINO run provenance identity")
+    expected_objects = {record.name for record in manifest.objects}
+    expected_root = expected_objects | ({"run.json"} if require_run else set())
+    actual_root = set(os.listdir(lino_fd))
+    allowed_root = expected_objects | ({"run.json"} if allow_run else set())
+    extras = actual_root - allowed_root
+    if extras:
+        raise ValueError("extra LINO prediction artifact(s): " + ", ".join(sorted(extras)))
+    if require_all_objects:
+        missing = expected_objects - actual_root
+        if missing:
+            raise ValueError(
+                "missing LINO object output(s): " + ", ".join(sorted(missing))
+            )
+    if require_run and actual_root != expected_root:
+        missing = expected_root - actual_root
+        raise ValueError("missing LINO artifact(s): " + ", ".join(sorted(missing)))
+
+    if "run.json" in actual_root:
+        run_info = os.stat("run.json", dir_fd=lino_fd, follow_symlinks=False)
+        if not stat.S_ISREG(run_info.st_mode):
+            raise ValueError("LINO run provenance must be a regular non-symlink file")
+        run_identity = (int(run_info.st_dev), int(run_info.st_ino))
+        if expected_run_identity is not None and run_identity != expected_run_identity:
+            raise ValueError("LINO run provenance was replaced after publication")
+
+    directory_flags = _secure_directory_flags()
+    expected_files = {"normal_pred.exr"}
+    if save_png:
+        expected_files.add("normal_pred.png")
+    for object_name in sorted(expected_objects & actual_root):
+        before = os.stat(object_name, dir_fd=lino_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ValueError(f"LINO object output must be a real directory: {object_name}")
+        object_fd = os.open(object_name, directory_flags, dir_fd=lino_fd)
+        try:
+            opened = os.fstat(object_fd)
+            if (int(opened.st_dev), int(opened.st_ino)) != (
+                int(before.st_dev),
+                int(before.st_ino),
+            ):
+                raise ValueError(f"LINO object output was replaced: {object_name}")
+            actual_files = set(os.listdir(object_fd))
+            extra_files = actual_files - expected_files
+            if extra_files:
+                raise ValueError(
+                    f"extra LINO prediction artifact(s) for {object_name}: "
+                    + ", ".join(sorted(extra_files))
+                )
+            if require_all_objects:
+                missing_files = expected_files - actual_files
+                if missing_files:
+                    raise ValueError(
+                        f"missing LINO prediction artifact(s) for {object_name}: "
+                        + ", ".join(sorted(missing_files))
+                    )
+            for basename in sorted(expected_files & actual_files):
+                info = os.stat(basename, dir_fd=object_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError(
+                        f"LINO prediction must be a regular non-symlink file: "
+                        f"{object_name}/{basename}"
+                    )
+        finally:
+            os.close(object_fd)
+
+
+def _invalidate_lino_run(lino_fd: int) -> None:
+    """Remove stale success provenance before any rerun artifact is mutated."""
+
+    try:
+        info = os.stat("run.json", dir_fd=lino_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("LINO run provenance must be a regular non-symlink file")
+    os.unlink("run.json", dir_fd=lino_fd)
+    os.fsync(lino_fd)
+
+
+def _remove_published_lino_run(
+    lino_fd: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Roll back this invocation's success marker without following replacements."""
+
+    try:
+        info = os.stat("run.json", dir_fd=lino_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        return
+    if (int(info.st_dev), int(info.st_ino)) != expected_identity:
+        return
+    os.unlink("run.json", dir_fd=lino_fd)
+    os.fsync(lino_fd)
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert metadata/tensor scalar values into strict JSON values."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if torch.is_tensor(value):
+        return _json_safe(value.detach().cpu().tolist())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise TypeError(f"value is not JSON serializable: {type(value)!r}")
+
+
+def _repository_commit(repo_root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = completed.stdout.strip()
+    return commit or None
+
+
+def _selection_paths(config: SdmExrInferenceConfig) -> tuple[Path, Path]:
+    """Return input source and canonical persisted selection paths.
+
+    ``SdmExrInferenceConfig.effective_selection_manifest_path`` intentionally
+    points to a user-supplied manifest in manifest mode.  The runner therefore
+    persists a separate canonical copy under the policy output and never
+    replaces that input file.
+    """
+
+    source = Path(config.effective_selection_manifest_path)
+    if config.light_selection == "manifest" and config.selection_manifest is not None:
+        canonical = config.policy_root / "selected_lights.json"
+    else:
+        canonical = source
+    return source, canonical
+
+
+def _persist_manifests(
+    config: SdmExrInferenceConfig,
+    manifest: DatasetManifest,
+    *,
+    policy_fd: int | None = None,
+    policy_identity: Mapping[str, int] | None = None,
+    policy_path: Path | None = None,
+    selection_source_bytes: bytes | None = None,
+) -> tuple[Path, Path, str, str, str | None]:
+    """Persist rich/effective manifests and return their exact digests."""
+
+    owns_descriptor = policy_fd is None
+    if owns_descriptor:
+        if policy_identity is not None or policy_path is not None:
+            raise ValueError("unpinned manifest publication received partial policy metadata")
+        policy_fd, opened_identity, opened_path = _open_or_create_directory(
+            config.policy_root,
+            label="LINO policy output directory",
+        )
+        policy_identity = opened_identity
+        policy_path = opened_path
+    elif policy_identity is None or policy_path is None:
+        raise ValueError("pinned manifest publication requires policy identity and path")
+    assert policy_fd is not None
+    assert policy_identity is not None
+    assert policy_path is not None
+    try:
+        persisted = persist_comparison_manifests_at_fd(
+            config,
+            manifest,
+            policy_fd=policy_fd,
+            policy_identity=policy_identity,
+            policy_path=policy_path,
+            selection_source_bytes=selection_source_bytes,
+        )
+        return (
+            Path(persisted["input_manifest_path"]),
+            Path(persisted["effective_selection_manifest_path"]),
+            str(persisted["input_manifest_sha256"]),
+            str(persisted["selection_manifest_sha256"]),
+            str(persisted["effective_selection_manifest_sha256"]),
+        )
+    finally:
+        if owns_descriptor:
+            try:
+                os.close(policy_fd)
+            except OSError:
+                pass
+
+
+def _seed_for_object(config: SdmExrInferenceConfig, object_name: str) -> int:
+    # NumPy accepts unsigned 32-bit seeds while torch accepts signed 64-bit
+    # seeds.  Derive both deterministically from the same stable object seed.
+    return stable_seed(config.seed, object_name, "lino_inference")
+
+
+def _seed_object_rngs(seed: int, *, cuda: bool) -> None:
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed % (2**63 - 1))
+    if cuda:
+        torch.cuda.manual_seed_all(seed % (2**63 - 1))
+
+
+def _collate_sample(sample: Any) -> dict[str, Any]:
+    if not isinstance(sample, Mapping):
+        raise TypeError("dataset samples must be mappings")
+    if "imgs" not in sample or "mask" not in sample:
+        raise ValueError("dataset sample is missing imgs or mask")
+
+    imgs = sample["imgs"]
+    if not torch.is_tensor(imgs):
+        raise TypeError("dataset imgs must be a torch.Tensor")
+    if imgs.ndim == 4:
+        from src.data.sdm_exr_data import collate_single_sdm_exr
+
+        batch = collate_single_sdm_exr([dict(sample)])
+    elif imgs.ndim == 5:
+        batch = dict(sample)
+    else:
+        raise ValueError(f"dataset imgs must be [C,H,W,N] or [B,C,H,W,N], got {imgs.shape}")
+
+    required = {"imgs", "mask", "mask_original", "roi", "metadata"}
+    if set(batch) != required:
+        raise ValueError(f"dataset batch fields must be {sorted(required)}")
+    return batch
+
+
+def _model_batch_on_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+    """Move only model image/mask tensors; preserve CPU ROI/mask metadata."""
+
+    result = dict(batch)
+    for field in ("imgs", "mask"):
+        value = result[field]
+        if not torch.is_tensor(value):
+            raise TypeError(f"dataset field {field} must be a torch.Tensor")
+        if value.dtype != torch.float32:
+            raise ValueError(f"dataset field {field} must remain float32")
+        result[field] = value.to(device=device)
+    for field in ("roi", "mask_original"):
+        value = result[field]
+        if not torch.is_tensor(value):
+            raise TypeError(f"dataset field {field} must be a torch.Tensor")
+        if value.device.type != "cpu":
+            raise ValueError(f"dataset field {field} must remain on CPU")
+        if field == "roi" and value.dtype not in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            raise ValueError("dataset field roi must remain an integer CPU tensor")
+        if field == "mask_original" and value.dtype != torch.float32:
+            raise ValueError("dataset field mask_original must remain a float32 CPU tensor")
+    return result
+
+
+def _autocast_context(device: torch.device, dtype: torch.dtype):
+    if device.type == "cuda" and dtype != torch.float32:
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return contextlib.nullcontext()
+
+
+def _normalise_prediction(raw: Any, *, height: int, width: int) -> np.ndarray:
+    if torch.is_tensor(raw):
+        array = raw.detach().to(device="cpu", dtype=torch.float32).numpy()
+    else:
+        try:
+            array = np.asarray(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("LINO forward must return a numeric normal array") from exc
+    if array.ndim != 3 or array.shape != (height, width, 3):
+        raise ValueError(
+            "LINO forward must return source-resolution [H0,W0,3] output: "
+            f"got {array.shape}, expected {(height, width, 3)}"
+        )
+    try:
+        array = np.asarray(array, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("LINO forward must return a numeric normal array") from exc
+    if not np.isfinite(array).all():
+        raise ValueError("LINO forward returned non-finite normals")
+
+    # Normalize each nonzero vector and preserve exact zero support.  This is
+    # intentionally the only postprocessing: no model/input mask is reapplied.
+    lengths = np.linalg.norm(array.astype(np.float64), axis=2, keepdims=True)
+    normalized = np.zeros_like(array, dtype=np.float32)
+    np.divide(array, lengths, out=normalized, where=lengths > 0)
+    if not np.isfinite(normalized).all():
+        raise ValueError("normalized LINO normals are non-finite")
+    return np.ascontiguousarray(normalized, dtype=np.float32)
+
+
+def _run_lino_inference_pinned(
+    config: SdmExrInferenceConfig,
+    manifest: DatasetManifest,
+    output_tree: tuple[int, dict[str, int], Path, int, dict[str, int], Path],
+    *,
+    model_loader: ModelLoader | None,
+    dataset_factory: DatasetFactory | None,
+    device: torch.device,
+    dtype: torch.dtype,
+    checkpoint: Path,
+    checkpoint_bytes: bytes,
+    checkpoint_digest: str,
+    checkpoint_identity: Mapping[str, int],
+    config_file_path: Path | None,
+    config_digest: str | None,
+    selection_source_bytes: bytes | None,
+) -> dict[str, Any]:
+    (
+        policy_fd,
+        policy_identity,
+        policy_path,
+        lino_fd,
+        lino_identity,
+        lino_path,
+    ) = output_tree
+    _assert_directory_path_identity(
+        policy_path,
+        policy_identity,
+        label="LINO policy output directory",
+    )
+    _assert_directory_path_identity(
+        lino_path,
+        lino_identity,
+        label="LINO output directory",
+    )
+    _validate_lino_output_tree(
+        lino_fd,
+        manifest,
+        save_png=config.save_png,
+        require_all_objects=False,
+        require_run=False,
+    )
+    _invalidate_lino_run(lino_fd)
+    _, canonical_selection, input_digest, selection_digest, canonical_digest = _persist_manifests(
+        config,
+        manifest,
+        policy_fd=policy_fd,
+        policy_identity=policy_identity,
+        policy_path=policy_path,
+        selection_source_bytes=selection_source_bytes,
+    )
+    source_selection, _ = _selection_paths(config)
+
+    factory = dataset_factory or _default_dataset_factory
+    dataset = factory(config, manifest)
+    if dataset is None:
+        raise ValueError("dataset_factory returned None")
+    try:
+        object_count = len(dataset)
+    except (TypeError, AttributeError) as exc:
+        raise TypeError("dataset_factory result must be a sized sequence") from exc
+    if object_count != len(manifest.objects):
+        raise ValueError(
+            f"dataset length {object_count} does not match manifest object count "
+            f"{len(manifest.objects)}"
+        )
+
+    if model_loader is None:
+        model = load_local_lino_checkpoint(
+            config,
+            device,
+            checkpoint_bytes=checkpoint_bytes,
+        )
+    else:
+        model = model_loader(config, device)
+    if model is None:
+        raise ValueError("model_loader returned None")
+    eval_method = getattr(model, "eval", None)
+    if callable(eval_method):
+        eval_method()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    object_records: list[dict[str, Any]] = []
+
+    for index, record in enumerate(manifest.objects):
+        object_started = time.perf_counter()
+        seed = _seed_for_object(config, record.name)
+        _seed_object_rngs(seed, cuda=device.type == "cuda")
+        sample = dataset[index]
+        batch = _collate_sample(sample)
+        metadata = batch["metadata"]
+        if not isinstance(metadata, Mapping):
+            raise ValueError(f"dataset metadata must be a mapping for {record.name}")
+        object_name = str(metadata.get("object_name", record.name))
+        if object_name != record.name:
+            raise ValueError(
+                f"dataset object order/name mismatch: expected {record.name}, got {object_name}"
+            )
+
+        model_batch = _model_batch_on_device(batch, device)
+        with torch.inference_mode():
+            with _autocast_context(device, dtype):
+                raw_prediction = model(model_batch)
+        prediction = _normalise_prediction(
+            raw_prediction,
+            height=int(record.height),
+            width=int(record.width),
+        )
+
+        _assert_directory_path_identity(
+            policy_path,
+            policy_identity,
+            label="LINO policy output directory",
+        )
+        _assert_directory_path_identity(
+            lino_path,
+            lino_identity,
+            label="LINO output directory",
+        )
+        object_fd: int | None = None
+        try:
+            object_fd, object_identity, object_path = _open_or_create_child_directory(
+                lino_fd,
+                lino_path,
+                record.name,
+                label=f"LINO object output for {record.name}",
+            )
+            existing_names = set(os.listdir(object_fd))
+            allowed_names = {"normal_pred.exr"}
+            if config.save_png:
+                allowed_names.add("normal_pred.png")
+            extras = existing_names - allowed_names
+            if extras:
+                raise ValueError(
+                    f"extra LINO prediction artifact(s) for {record.name}: "
+                    + ", ".join(sorted(extras))
+                )
+            exr_bytes = encode_normal_exr(prediction)
+            _write_bytes_at_fd(
+                object_fd,
+                "normal_pred.exr",
+                exr_bytes,
+                expected_directory_identity=object_identity,
+                directory_path=object_path,
+                label=f"LINO prediction for {record.name}",
+            )
+            if config.save_png:
+                png_bytes = encode_normal_png(prediction)
+                _write_bytes_at_fd(
+                    object_fd,
+                    "normal_pred.png",
+                    png_bytes,
+                    expected_directory_identity=object_identity,
+                    directory_path=object_path,
+                    label=f"LINO preview for {record.name}",
+                )
+            _assert_directory_path_identity(
+                object_path,
+                object_identity,
+                label=f"LINO object output for {record.name}",
+            )
+            _assert_directory_path_identity(
+                lino_path,
+                lino_identity,
+                label="LINO output directory",
+            )
+            _assert_directory_path_identity(
+                policy_path,
+                policy_identity,
+                label="LINO policy output directory",
+            )
+            exr_path = object_path / "normal_pred.exr"
+            png_path = object_path / "normal_pred.png"
+            output_digest = sha256_bytes(exr_bytes)
+        finally:
+            if object_fd is not None:
+                os.close(object_fd)
+
+        object_records.append(
+            {
+                "object_name": record.name,
+                "selected_images": list(record.selected_images),
+                "source_geometry": {
+                    "height": int(record.height),
+                    "width": int(record.width),
+                },
+                "metadata": _json_safe(metadata),
+                "seed": int(seed),
+                "runtime_seconds": time.perf_counter() - object_started,
+                "output_path": str(exr_path) if config.save_exr else None,
+                "preview_path": str(png_path) if config.save_png else None,
+                "output_sha256": output_digest,
+            }
+        )
+        del model_batch, batch, sample, raw_prediction, prediction
+
+    runtime_seconds = time.perf_counter() - started
+    if device.type == "cuda":
+        peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    else:
+        peak_allocated = None
+        peak_reserved = None
+
+    repo_root = Path(__file__).resolve().parents[2]
+    provenance: dict[str, Any] = {
+        "model": "LINO-UniPS",
+        "config_path": str(config_file_path.resolve(strict=True)) if config_file_path else None,
+        "config_sha256": config_digest,
+        "config_runtime_fingerprint": config_runtime_fingerprint(config),
+        "checkpoint_sha256": checkpoint_digest,
+        "checkpoint_path": str(checkpoint.resolve(strict=True)),
+        "checkpoint_identity": checkpoint_identity,
+        "preprocessing": lino_preprocessing_snapshot(config),
+        "repository_commit": _repository_commit(repo_root),
+        "mask_policy": config.mask_policy,
+        "input_manifest_sha256": input_digest,
+        "selection_manifest_sha256": selection_digest,
+        "effective_selection_manifest_sha256": canonical_digest,
+        "selection_manifest_path": str(source_selection),
+        "effective_selection_manifest_path": str(canonical_selection),
+        "device": str(device),
+        "precision": config.precision,
+        "requested_precision": config.precision,
+        "effective_precision": config.precision,
+        "objects": object_records,
+        "runtime_seconds": runtime_seconds,
+        "peak_cuda_allocated_bytes": peak_allocated,
+        "peak_cuda_reserved_bytes": peak_reserved,
+    }
+    serialized_provenance = (
+        json.dumps(
+            provenance,
+            indent=2,
+            sort_keys=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    _validate_lino_output_tree(
+        lino_fd,
+        manifest,
+        save_png=config.save_png,
+        require_all_objects=True,
+        require_run=False,
+        allow_run=False,
+    )
+    _assert_directory_path_identity(
+        policy_path,
+        policy_identity,
+        label="LINO policy output directory",
+    )
+    _assert_directory_path_identity(
+        lino_path,
+        lino_identity,
+        label="LINO output directory",
+    )
+    run_identity = _write_bytes_at_fd(
+        lino_fd,
+        "run.json",
+        serialized_provenance,
+        expected_directory_identity=lino_identity,
+        directory_path=lino_path,
+        label="LINO run provenance",
+    )
+    try:
+        _validate_lino_output_tree(
+            lino_fd,
+            manifest,
+            save_png=config.save_png,
+            require_all_objects=True,
+            require_run=True,
+            expected_run_identity=run_identity,
+        )
+        _assert_directory_path_identity(
+            lino_path,
+            lino_identity,
+            label="LINO output directory",
+        )
+        _assert_directory_path_identity(
+            policy_path,
+            policy_identity,
+            label="LINO policy output directory",
+        )
+    except Exception:
+        _remove_published_lino_run(lino_fd, run_identity)
+        raise
+    return provenance
+
+
+def run_lino_inference(
+    config: SdmExrInferenceConfig,
+    *,
+    model_loader: ModelLoader | None = None,
+    dataset_factory: DatasetFactory | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run one deterministic sequential LINO inference and persist provenance."""
+
+    if not isinstance(config, SdmExrInferenceConfig):
+        raise TypeError("config must be an SdmExrInferenceConfig")
+    if not config.save_exr:
+        raise ValueError("save_exr must be true for authoritative LINO output")
+
+    device = _resolve_device(config)
+    dtype = _precision_dtype(config)
+    if model_loader is None and device.type != "cuda":
+        raise RuntimeError("released LINO checkpoint inference requires CUDA bf16")
+    checkpoint = Path(config.checkpoint)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"LINO checkpoint does not exist: {checkpoint}")
+    checkpoint_identity_before = file_identity(checkpoint, label="LINO checkpoint")
+    checkpoint_bytes = read_file_bytes(checkpoint, label="LINO checkpoint")
+    checkpoint_digest = sha256_bytes(checkpoint_bytes)
+    checkpoint_identity = file_identity(checkpoint, label="LINO checkpoint")
+    if checkpoint_identity != checkpoint_identity_before:
+        raise ValueError("LINO checkpoint was replaced while reading its immutable snapshot")
+
+    config_file_path: Path | None = None
+    config_digest: str | None = None
+    if config_path is not None:
+        config_file_path = Path(config_path)
+        config_raw = read_file_bytes(config_file_path, label="LINO config")
+        config_digest = sha256_bytes(config_raw)
+
+    selection_source_bytes: bytes | None = None
+    if config.light_selection == "manifest":
+        selection_source_bytes = read_file_bytes(
+            config.effective_selection_manifest_path,
+            label="selection manifest",
+        )
+    manifest = build_dataset_manifest(
+        config,
+        selection_manifest_bytes=selection_source_bytes,
+    )
+    with _pinned_lino_output_tree(config) as output_tree:
+        return _run_lino_inference_pinned(
+            config,
+            manifest,
+            output_tree,
+            model_loader=model_loader,
+            dataset_factory=dataset_factory,
+            device=device,
+            dtype=dtype,
+            checkpoint=checkpoint,
+            checkpoint_bytes=checkpoint_bytes,
+            checkpoint_digest=checkpoint_digest,
+            checkpoint_identity=checkpoint_identity,
+            config_file_path=config_file_path,
+            config_digest=config_digest,
+            selection_source_bytes=selection_source_bytes,
+        )
+
+
+__all__ = ["load_local_lino_checkpoint", "run_lino_inference"]

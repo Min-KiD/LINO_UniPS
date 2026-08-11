@@ -1,0 +1,30 @@
+# Single LINO/SDM comparison preset.  Keep this file as the only checked-in
+# protocol config; change mask_policy below instead of making masked/full copies.
+
+checkpoint: "/path/to/lino.pth" # Local released LINO checkpoint; replace this placeholder.
+data_root: "/mnt/18TData/minhnv/test" # Root containing one SDM-style object per directory.
+output_root: "./output/sdm_lino_comparison" # The selected mask policy is appended automatically.
+object_suffix: ".data" # Object directories end with this suffix.
+image_prefix: "image" # Selected observations use this filename prefix.
+image_extension: ".exr" # Input observations are three-channel EXR files.
+max_image_num: 16 # Number of lights selected per object.
+light_selection: "seeded" # Seeded mode writes one shared deterministic SDM selection manifest.
+selection_manifest: "" # Leave blank for seeded mode; manifest mode requires a path.
+seed: 20260710 # Shared seed for deterministic light selection.
+mask_policy: "external" # Change only this field: external uses the mask; full is mask-free.
+external_mask_filename: "binary_mask.exr" # External model-input mask basename.
+normal_filenames:
+  - "local_normal.exr" # Ground-truth normal basename; hidden from model/SDM inputs.
+normal_encoding: "signed" # Normal EXR channels are signed vectors in [-1, 1].
+mask_margin: 8 # ROI margin used by the released LINO preprocessing.
+max_image_resolution: 2048 # Must be a positive multiple of LINO's 512-pixel tile size.
+pixel_samples: 2048 # LINO decoder/pixel-chunk setting; SDM reads baseline_optimized_infer.yaml's separate value (the printed command does not override it).
+precision: "bf16" # Released-checkpoint inference requires CUDA bf16.
+device: "auto" # Resolves to CUDA for the released checkpoint route.
+num_workers: 0 # Reserved/validated only; LINO is explicitly sequential and does not consume it; SDM baseline is currently 0.
+save_exr: true # Signed source-resolution EXRs are authoritative prediction outputs.
+save_png: true # PNGs are optional previews and are never scored.
+
+# For a final paired run, keep the generated exact selected_lights.json and
+# switch light_selection to manifest.  Set selection_manifest to that file;
+# the policy alias output/<policy>/selected_lights.json is also accepted.
