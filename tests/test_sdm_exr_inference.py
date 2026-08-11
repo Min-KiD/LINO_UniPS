@@ -671,33 +671,40 @@ class SdmExrInferenceTests(unittest.TestCase):
             {"weights_only": False, "map_location": "cpu"},
         )
 
-    def test_local_loader_reports_complete_missing_and_unexpected_keys(self):
+    def test_local_loader_preserves_author_permissive_checkpoint_loading(self):
+        captured = {}
+
         class FakeLiNo:
             def __init__(self, **_kwargs):
                 pass
 
             def load_state_dict(self, _state_dict, strict):
-                self.strict = strict
+                captured["strict"] = strict
                 return types.SimpleNamespace(
                     missing_keys=["missing.a", "missing.b"],
                     unexpected_keys=["unexpected.c"],
                 )
 
-            def to(self, _device):
+            def to(self, device):
+                captured["device"] = device
                 return self
 
             def eval(self):
+                captured["eval"] = True
                 return self
 
-        config = self._loader_config()
+        pt_checkpoint = self.checkpoint.with_suffix(".pt")
+        pt_checkpoint.write_bytes(self.checkpoint.read_bytes())
+        config = self._loader_config(checkpoint=pt_checkpoint)
         with mock.patch.dict(sys.modules, self._fake_model_modules(FakeLiNo)):
             with mock.patch.object(inference.torch.cuda, "is_available", return_value=True):
                 with mock.patch.object(inference.torch, "load", return_value={"weight": 1}):
-                    with self.assertRaisesRegex(
-                        RuntimeError,
-                        r"missing_keys=\['missing\.a', 'missing\.b'\].*unexpected_keys=\['unexpected\.c'\]",
-                    ):
-                        load_local_lino_checkpoint(config, torch.device("cuda"))
+                    model = load_local_lino_checkpoint(config, torch.device("cuda"))
+
+        self.assertIsInstance(model, FakeLiNo)
+        self.assertFalse(captured["strict"])
+        self.assertEqual(captured["device"], torch.device("cuda"))
+        self.assertTrue(captured["eval"])
 
     def test_malformed_prediction_shapes_and_nonfinite_values_fail(self):
         self.make_dataset("alpha.data")

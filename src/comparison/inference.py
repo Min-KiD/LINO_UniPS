@@ -122,21 +122,10 @@ def load_local_lino_checkpoint(
     if not isinstance(state_dict, Mapping):
         raise ValueError("LINO checkpoint must contain a state-dict mapping")
 
-    incompatible = model.load_state_dict(state_dict, strict=False)
-    if isinstance(incompatible, Mapping):
-        missing = list(incompatible.get("missing_keys", ()))
-        unexpected = list(incompatible.get("unexpected_keys", ()))
-    elif isinstance(incompatible, tuple) and len(incompatible) == 2:
-        missing = list(incompatible[0])
-        unexpected = list(incompatible[1])
-    else:
-        missing = list(getattr(incompatible, "missing_keys", ()))
-        unexpected = list(getattr(incompatible, "unexpected_keys", ()))
-    if missing or unexpected:
-        raise RuntimeError(
-            "LINO checkpoint keys do not match the released architecture: "
-            f"missing_keys={missing!r}, unexpected_keys={unexpected!r}"
-        )
+    # Match the author's released loaders in ``hubconf.py`` and
+    # ``LiNo_UniPS.from_pretrained``: published checkpoints are intentionally
+    # loaded non-strictly, without rejecting missing or unexpected keys.
+    model.load_state_dict(state_dict, strict=False)
 
     # Preserve checkpoint parameter storage precision.  Autocast in the
     # inference loop controls operation precision without a permanent cast.
