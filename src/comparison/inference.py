@@ -1073,44 +1073,46 @@ def run_lino_inference(
     total_started = clock()
     if not isinstance(config, SdmExrInferenceConfig):
         raise TypeError("config must be an SdmExrInferenceConfig")
-    if not config.save_exr:
-        raise ValueError("save_exr must be true for authoritative LINO output")
-
-    device = _resolve_device(config)
-    dtype = _precision_dtype(config)
-    if model_loader is None and device.type != "cuda":
-        raise RuntimeError("released LINO checkpoint inference requires CUDA bf16")
-    checkpoint = Path(config.checkpoint)
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"LINO checkpoint does not exist: {checkpoint}")
-    checkpoint_identity_before = file_identity(checkpoint, label="LINO checkpoint")
-    checkpoint_bytes = read_file_bytes(checkpoint, label="LINO checkpoint")
-    checkpoint_digest = sha256_bytes(checkpoint_bytes)
-    checkpoint_identity = file_identity(checkpoint, label="LINO checkpoint")
-    if checkpoint_identity != checkpoint_identity_before:
-        raise ValueError("LINO checkpoint was replaced while reading its immutable snapshot")
-
-    config_file_path: Path | None = None
-    config_digest: str | None = None
-    if config_path is not None:
-        config_file_path = Path(config_path)
-        config_raw = read_file_bytes(config_file_path, label="LINO config")
-        config_digest = sha256_bytes(config_raw)
-
-    selection_source_bytes: bytes | None = None
-    if config.light_selection == "manifest":
-        selection_source_bytes = read_file_bytes(
-            config.effective_selection_manifest_path,
-            label="selection manifest",
-        )
-    print(f"Exploring {config.data_root}")
-    manifest = build_dataset_manifest(
-        config,
-        selection_manifest_bytes=selection_source_bytes,
-    )
-    print(f"Found {len(manifest.objects)} objects!\n")
-    print(f"Using device: {device}")
     with _pinned_lino_output_tree(config) as output_tree:
+        _, _, _, lino_fd, _, _ = output_tree
+        _invalidate_lino_run(lino_fd)
+        if not config.save_exr:
+            raise ValueError("save_exr must be true for authoritative LINO output")
+
+        device = _resolve_device(config)
+        dtype = _precision_dtype(config)
+        if model_loader is None and device.type != "cuda":
+            raise RuntimeError("released LINO checkpoint inference requires CUDA bf16")
+        checkpoint = Path(config.checkpoint)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"LINO checkpoint does not exist: {checkpoint}")
+        checkpoint_identity_before = file_identity(checkpoint, label="LINO checkpoint")
+        checkpoint_bytes = read_file_bytes(checkpoint, label="LINO checkpoint")
+        checkpoint_digest = sha256_bytes(checkpoint_bytes)
+        checkpoint_identity = file_identity(checkpoint, label="LINO checkpoint")
+        if checkpoint_identity != checkpoint_identity_before:
+            raise ValueError("LINO checkpoint was replaced while reading its immutable snapshot")
+
+        config_file_path: Path | None = None
+        config_digest: str | None = None
+        if config_path is not None:
+            config_file_path = Path(config_path)
+            config_raw = read_file_bytes(config_file_path, label="LINO config")
+            config_digest = sha256_bytes(config_raw)
+
+        selection_source_bytes: bytes | None = None
+        if config.light_selection == "manifest":
+            selection_source_bytes = read_file_bytes(
+                config.effective_selection_manifest_path,
+                label="selection manifest",
+            )
+        print(f"Exploring {config.data_root}")
+        manifest = build_dataset_manifest(
+            config,
+            selection_manifest_bytes=selection_source_bytes,
+        )
+        print(f"Found {len(manifest.objects)} objects!\n")
+        print(f"Using device: {device}")
         result = _run_lino_inference_pinned(
             config,
             manifest,

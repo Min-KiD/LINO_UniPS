@@ -149,6 +149,30 @@ class SdmExrInferenceTests(unittest.TestCase):
             run_lino_inference(config, model_loader=model_loader)
         self.assertFalse(called)
 
+    def test_missing_checkpoint_rerun_invalidates_previous_run_record(self):
+        self.make_dataset("alpha.data")
+        config = self.config()
+        self.run_with_stub(config)
+        self.assertTrue(config.provenance_path.is_file())
+
+        missing = self.root / "missing-rerun-checkpoint.pth"
+        rerun_config = replace(config, checkpoint=missing)
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            with self.assertRaises(FileNotFoundError):
+                run_lino_inference(
+                    rerun_config,
+                    model_loader=lambda *_args: (_ for _ in ()).throw(
+                        AssertionError("model loader must not run")
+                    ),
+                )
+
+        self.assertFalse(config.provenance_path.exists())
+        output = stdout.getvalue()
+        self.assertNotIn("Inference complete", output)
+        self.assertNotIn("Mean MAE", output)
+        self.assertNotIn("Total inference time", output)
+
     def test_inference_processes_objects_in_manifest_order(self):
         self.make_dataset("zeta.data", "alpha.data")
         result, calls = self.run_with_stub(self.config())
