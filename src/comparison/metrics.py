@@ -1053,7 +1053,7 @@ def _validate_sdm_completion(
     return sdm_paths, completion, completion_bytes, sdm_arrays
 
 
-def _source_gt(
+def load_source_gt(
     config: SdmExrInferenceConfig, record: ObjectRecord
 ) -> tuple[np.ndarray, Path]:
     root = Path(config.data_root).resolve(strict=False)
@@ -1186,7 +1186,7 @@ def score_lino_and_sdm(
 
     rows: list[dict[str, Any]] = []
     for record in manifest.objects:
-        gt, gt_path = _source_gt(config, record)
+        gt, gt_path = load_source_gt(config, record)
         support = normal_validity_mask(gt)
         lino_path = lino_paths[record.name]
         run_item = run_by_name[record.name]
@@ -1332,6 +1332,7 @@ def score_lino_and_sdm(
 __all__ = [
     "normal_validity_mask",
     "angular_metrics",
+    "load_source_gt",
     "finalize_sdm_run",
     "score_lino_and_sdm",
 ]

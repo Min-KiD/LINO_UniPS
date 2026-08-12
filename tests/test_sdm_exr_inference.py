@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -22,7 +24,7 @@ from src.comparison.config import SdmExrInferenceConfig
 from src.comparison.exr_io import read_rgb_exr, sha256_file
 import src.comparison.inference as inference
 from src.comparison.inference import load_local_lino_checkpoint, run_lino_inference
-from tests.comparison_helpers import make_object
+from tests.comparison_helpers import make_object, write_rgb_exr
 
 
 class _StubModel(torch.nn.Module):
@@ -151,6 +153,99 @@ class SdmExrInferenceTests(unittest.TestCase):
         expected[..., 1] = 0.8
         np.testing.assert_allclose(decoded, expected, atol=1e-4)
         self.assertEqual(result["objects"][0]["output_sha256"], sha256_file(prediction))
+
+    def test_run_records_macro_mae_from_authoritative_prediction_exr(self):
+        self.make_dataset("alpha.data", "zeta.data")
+        config = self.config()
+        result, calls = self.run_with_stub(config)
+
+        self.assertEqual(len(calls), 2)
+        self.assertAlmostEqual(result["mean_mae"], 90.0, places=5)
+        self.assertEqual(result["mae_objects"], 2)
+        for item in result["objects"]:
+            self.assertAlmostEqual(item["mae"], 90.0, places=5)
+            self.assertEqual(item["valid_pixel_count"], 6)
+
+        written = json.loads(config.provenance_path.read_text(encoding="utf-8"))
+        self.assertEqual(written, result)
+
+    def test_console_reports_dataset_progress_mae_and_total_time(self):
+        self.make_dataset("alpha.data", "zeta.data")
+        config = self.config()
+        timestamps = iter([0.0, 10.0, 10.0, 20.0, 20.0, 40.0, 45.0])
+        stdout = StringIO()
+
+        with redirect_stdout(stdout):
+            result = run_lino_inference(
+                config,
+                model_loader=lambda *_args: _StubModel([]),
+                clock=lambda: next(timestamps),
+            )
+
+        output = stdout.getvalue()
+        self.assertIn(f"Exploring {config.data_root}", output)
+        self.assertIn("Found 2 objects!", output)
+        self.assertIn("Using device: cpu", output)
+        self.assertIn(
+            "LINO progress: 1/2 | elapsed 00:00:10 | ETA 00:00:10",
+            output,
+        )
+        self.assertIn(
+            "LINO progress: 2/2 | elapsed 00:00:30 | ETA 00:00:00",
+            output,
+        )
+        self.assertIn(
+            f"Inference complete: 2 objects -> {config.lino_output_dir}",
+            output,
+        )
+        self.assertIn("Mean MAE (2 objects): 90.0000", output)
+        self.assertIn("Total inference time: 00:00:45", output)
+        self.assertAlmostEqual(result["mean_mae"], 90.0, places=5)
+
+    def test_failed_run_never_prints_completion_summary(self):
+        self.make_dataset("alpha.data")
+        config = self.config()
+        stdout = StringIO()
+
+        def fail_loader(*_args):
+            raise RuntimeError("forced inference failure")
+
+        with redirect_stdout(stdout):
+            with self.assertRaisesRegex(RuntimeError, "forced inference failure"):
+                run_lino_inference(config, model_loader=fail_loader)
+
+        output = stdout.getvalue()
+        self.assertNotIn("Inference complete", output)
+        self.assertNotIn("Mean MAE", output)
+        self.assertNotIn("Total inference time", output)
+
+    def test_released_normal_model_has_no_obsolete_tile_wait_message(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "src/models/Net_module.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("please wait for a moment, it may take a while", source)
+
+    def test_gt_changed_after_manifest_snapshot_fails_without_run_provenance(self):
+        self.make_dataset("alpha.data")
+        config = self.config()
+
+        class MutatingModel(_StubModel):
+            def forward(inner_self, batch):
+                prediction = super().forward(batch)
+                changed = np.zeros((2, 3, 3), dtype=np.float32)
+                changed[..., 0] = 1.0
+                write_rgb_exr(
+                    config.data_root / "alpha.data" / "local_normal.exr",
+                    changed,
+                )
+                return prediction
+
+        with self.assertRaisesRegex(ValueError, "GT digest mismatch"):
+            run_lino_inference(
+                config,
+                model_loader=lambda *_args: MutatingModel([]),
+            )
+        self.assertFalse(config.provenance_path.exists())
 
     def test_policy_output_directories_do_not_overlap(self):
         self.make_dataset("alpha.data")

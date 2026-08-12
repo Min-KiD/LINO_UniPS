@@ -28,6 +28,7 @@ from .exr_io import (
     encode_normal_exr,
     encode_normal_png,
     read_file_bytes,
+    read_signed_normal_exr_bytes,
 )
 from .manifest import (
     DatasetManifest,
@@ -41,6 +42,12 @@ from .provenance import (
     file_identity,
     lino_preprocessing_snapshot,
     sha256_bytes,
+)
+from .metrics import angular_metrics, load_source_gt, normal_validity_mask
+from .reporting import (
+    estimate_eta_seconds,
+    format_clock_duration,
+    should_report_progress,
 )
 
 
@@ -678,6 +685,7 @@ def _run_lino_inference_pinned(
     config_file_path: Path | None,
     config_digest: str | None,
     selection_source_bytes: bytes | None,
+    clock: Callable[[], float],
 ) -> dict[str, Any]:
     (
         policy_fd,
@@ -745,11 +753,12 @@ def _run_lino_inference_pinned(
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    started = time.perf_counter()
+    started = clock()
+    last_object_finished = started
     object_records: list[dict[str, Any]] = []
 
     for index, record in enumerate(manifest.objects):
-        object_started = time.perf_counter()
+        object_started = clock()
         seed = _seed_for_object(config, record.name)
         _seed_object_rngs(seed, cuda=device.type == "cuda")
         sample = dataset[index]
@@ -802,6 +811,17 @@ def _run_lino_inference_pinned(
                     + ", ".join(sorted(extras))
                 )
             exr_bytes = encode_normal_exr(prediction)
+            scored_prediction = read_signed_normal_exr_bytes(
+                exr_bytes,
+                label=f"LINO prediction for {record.name}",
+            )
+            source_gt, _ = load_source_gt(config, record)
+            support = normal_validity_mask(source_gt)
+            object_metrics = angular_metrics(
+                source_gt,
+                scored_prediction,
+                support,
+            )
             _write_bytes_at_fd(
                 object_fd,
                 "normal_pred.exr",
@@ -842,6 +862,8 @@ def _run_lino_inference_pinned(
             if object_fd is not None:
                 os.close(object_fd)
 
+        object_finished = clock()
+        last_object_finished = object_finished
         object_records.append(
             {
                 "object_name": record.name,
@@ -852,15 +874,26 @@ def _run_lino_inference_pinned(
                 },
                 "metadata": _json_safe(metadata),
                 "seed": int(seed),
-                "runtime_seconds": time.perf_counter() - object_started,
+                "runtime_seconds": object_finished - object_started,
                 "output_path": str(exr_path) if config.save_exr else None,
                 "preview_path": str(png_path) if config.save_png else None,
                 "output_sha256": output_digest,
+                "mae": float(object_metrics["mae"]),
+                "valid_pixel_count": int(object_metrics["valid_pixel_count"]),
             }
         )
+        completed = index + 1
+        elapsed = object_finished - started
+        if should_report_progress(completed, object_count):
+            eta = estimate_eta_seconds(elapsed, completed, object_count)
+            print(
+                f"LINO progress: {completed}/{object_count} | "
+                f"elapsed {format_clock_duration(elapsed)} | "
+                f"ETA {format_clock_duration(eta)}"
+            )
         del model_batch, batch, sample, raw_prediction, prediction
 
-    runtime_seconds = time.perf_counter() - started
+    runtime_seconds = last_object_finished - started
     if device.type == "cuda":
         peak_allocated = int(torch.cuda.max_memory_allocated(device))
         peak_reserved = int(torch.cuda.max_memory_reserved(device))
@@ -869,6 +902,9 @@ def _run_lino_inference_pinned(
         peak_reserved = None
 
     repo_root = Path(__file__).resolve().parents[2]
+    mean_mae = float(
+        sum(float(item["mae"]) for item in object_records) / len(object_records)
+    )
     provenance: dict[str, Any] = {
         "model": "LINO-UniPS",
         "config_path": str(config_file_path.resolve(strict=True)) if config_file_path else None,
@@ -890,6 +926,8 @@ def _run_lino_inference_pinned(
         "requested_precision": config.precision,
         "effective_precision": config.precision,
         "objects": object_records,
+        "mean_mae": mean_mae,
+        "mae_objects": len(object_records),
         "runtime_seconds": runtime_seconds,
         "peak_cuda_allocated_bytes": peak_allocated,
         "peak_cuda_reserved_bytes": peak_reserved,
@@ -960,9 +998,12 @@ def run_lino_inference(
     model_loader: ModelLoader | None = None,
     dataset_factory: DatasetFactory | None = None,
     config_path: str | Path | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Run one deterministic sequential LINO inference and persist provenance."""
 
+    clock = time.perf_counter if clock is None else clock
+    total_started = clock()
     if not isinstance(config, SdmExrInferenceConfig):
         raise TypeError("config must be an SdmExrInferenceConfig")
     if not config.save_exr:
@@ -995,12 +1036,15 @@ def run_lino_inference(
             config.effective_selection_manifest_path,
             label="selection manifest",
         )
+    print(f"Exploring {config.data_root}")
     manifest = build_dataset_manifest(
         config,
         selection_manifest_bytes=selection_source_bytes,
     )
+    print(f"Found {len(manifest.objects)} objects!\n")
+    print(f"Using device: {device}")
     with _pinned_lino_output_tree(config) as output_tree:
-        return _run_lino_inference_pinned(
+        result = _run_lino_inference_pinned(
             config,
             manifest,
             output_tree,
@@ -1015,7 +1059,16 @@ def run_lino_inference(
             config_file_path=config_file_path,
             config_digest=config_digest,
             selection_source_bytes=selection_source_bytes,
+            clock=clock,
         )
+    total_runtime_seconds = clock() - total_started
+    print(
+        f"Inference complete: {len(manifest.objects)} objects -> "
+        f"{config.lino_output_dir}"
+    )
+    print(f"Mean MAE ({result['mae_objects']} objects): {result['mean_mae']:.4f}")
+    print(f"Total inference time: {format_clock_duration(total_runtime_seconds)}")
+    return result
 
 
 __all__ = ["load_local_lino_checkpoint", "run_lino_inference"]

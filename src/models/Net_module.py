@@ -34,7 +34,7 @@ class LiNo_UniPS(pl.LightningModule):
         self.test_mae = MeanMetric()
         self.test_loss = MeanMetric()
     def on_test_start(self):
-        
+
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.run_save_dir = f'output/{timestamp}/{self.task_name}/results/'
         os.makedirs(self.run_save_dir, exist_ok=True)
@@ -184,7 +184,6 @@ class LiNo_UniPS(pl.LightningModule):
         canonical_resolution = 256
         for k in range(sliding_blocks):
             """ Image Encoder at Canonical Resolution """
-            print("please wait for a moment, it may take a while")
             I = patches_I[:, k, :, :, :, :] 
             M = patches_M[:, k, :, :, :] 
             B, C, H, W, Nmax = I.shape
@@ -254,4 +253,3 @@ class LiNo_UniPS(pl.LightningModule):
 
     def forward(self, batch):
         return self.predict_step(batch=batch)
-        

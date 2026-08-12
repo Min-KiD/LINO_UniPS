@@ -145,6 +145,25 @@ conda activate LINO
 python eval.py --config "$CONFIG"
 ```
 
+The command reports object 1, every 100 completed objects, and the final
+object with elapsed time and ETA. On success it prints the LINO macro-object
+MAE and total end-to-end inference time. This immediate MAE is computed only
+after each prediction and never supplies ground truth to the model.
+
+Example completion output:
+
+```text
+LINO progress: 2399/2399 | elapsed 38:05:57 | ETA 00:00:00
+Inference complete: 2399 objects -> output/sdm_lino_comparison/external/lino
+Mean MAE (2399 objects): 0.7123
+Total inference time: 38:06:41
+```
+
+Runtime and VRAM are not compute-matched between the released pipelines: this
+LINO route can process a square up to 2048x2048 in 512x512 tiles, while the
+current optimized SDM preset uses 256x256. Treat timing as released-pipeline
+timing, not an architecture-only speed comparison.
+
 A successful run writes one prediction directory per object:
 
 ```text
@@ -276,6 +295,11 @@ The command prints:
 
 Both models are scored from signed source-resolution EXRs using the same valid
 source-normal support.
+
+This paired score remains the authoritative comparison even though LINO now
+prints its standalone MAE after `eval.py`. It additionally validates that LINO
+and SDM used the intended selected lights, mask policy, checkpoints,
+manifests, requests, hashes, and finalized prediction artifacts.
 
 ## 10. Output inventory
 
