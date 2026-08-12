@@ -1,0 +1,27 @@
+# Released-checkpoint transfer gate for the private 256x256 HDR EXR objects.
+# This is LINO-only inference; it does not train LINO or run/compare SDM.
+
+checkpoint: "./checkpoints/lino.pth" # Released houyuanchen/lino normal checkpoint.
+data_root: "/mnt/18TData/minhnv/inference" # Private object root on the training workstation.
+output_root: "./output/lino_private_transfer" # Isolated from the earlier invalid signed-GT run.
+object_suffix: ".data"
+image_prefix: "image"
+image_extension: ".exr"
+max_image_num: 16 # Exactly 16 deterministic observations per object.
+light_selection: "seeded"
+selection_manifest: ""
+seed: 20260710
+mask_policy: "external"
+external_mask_filename: "binary_mask.exr"
+normal_filenames:
+  - "local_normal.exr"
+normal_encoding: "unsigned" # Decode source GT as 2 * encoded - 1.
+expected_source_geometry: [256, 256] # Fail before model construction on another geometry.
+mask_margin: 8
+max_image_resolution: 512 # One author-native LINO tile after crop/resize.
+pixel_samples: 2048
+precision: "bf16"
+device: "cuda"
+num_workers: 0
+save_exr: true # Required authoritative signed prediction.
+save_png: false # Avoid nonauthoritative preview I/O for this gate.

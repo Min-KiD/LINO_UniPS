@@ -115,6 +115,38 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertTrue(config.save_exr)
         self.assertTrue(config.save_png)
 
+    def test_private_transfer_preset_encodes_the_approved_protocol(self):
+        from src.comparison.config import load_sdm_exr_config
+
+        repo_root = Path(__file__).resolve().parents[1]
+        config = load_sdm_exr_config(repo_root / "configs/lino_private_transfer.yaml")
+        self.assertEqual(config.checkpoint, Path("./checkpoints/lino.pth"))
+        self.assertEqual(config.data_root, Path("/mnt/18TData/minhnv/inference"))
+        self.assertEqual(config.output_root, Path("./output/lino_private_transfer"))
+        self.assertEqual(config.object_suffix, ".data")
+        self.assertEqual(config.image_prefix, "image")
+        self.assertEqual(config.image_extension, ".exr")
+        self.assertEqual(config.max_image_num, 16)
+        self.assertEqual(config.light_selection, "seeded")
+        self.assertEqual(config.seed, 20260710)
+        self.assertEqual(config.mask_policy, "external")
+        self.assertEqual(config.external_mask_filename, "binary_mask.exr")
+        self.assertEqual(config.normal_filenames, ("local_normal.exr",))
+        self.assertEqual(config.normal_encoding, "unsigned")
+        self.assertEqual(config.expected_source_geometry, (256, 256))
+        self.assertEqual(config.mask_margin, 8)
+        self.assertEqual(config.max_image_resolution, 512)
+        self.assertEqual(config.pixel_samples, 2048)
+        self.assertEqual(config.precision, "bf16")
+        self.assertEqual(config.device, "cuda")
+        self.assertEqual(config.num_workers, 0)
+        self.assertTrue(config.save_exr)
+        self.assertFalse(config.save_png)
+        self.assertEqual(
+            config.lino_output_dir,
+            Path("output/lino_private_transfer/external/lino"),
+        )
+
     def test_external_and_full_are_the_only_mask_policies(self):
         external = self.load(mask_policy="external")
         full = self.load(mask_policy="full")

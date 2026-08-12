@@ -91,8 +91,9 @@ Important requirements:
 
 - Every object needs at least `max_image_num` matching observation EXRs.
 - Observations, mask, and normal must have the same source resolution.
-- `local_normal.exr` contains signed XYZ normal vectors. It is used only for
-  common scoring and is hidden from both model inputs.
+- `local_normal.exr` is used only for scoring and is hidden from model inputs.
+  Set `normal_encoding: signed` for XYZ values already in signed coordinates, or
+  `normal_encoding: unsigned` for [0,1] values decoded as `2 * encoded - 1`.
 - `binary_mask.exr` is required when `mask_policy: "external"`.
 - The mask is not supplied when `mask_policy: "full"`.
 
@@ -174,6 +175,62 @@ A successful run writes one prediction directory per object:
 `normal_pred.exr` is the authoritative signed, source-resolution prediction.
 When enabled, `normal_pred.png` is only a preview and is never used for
 scoring.
+
+## Private 256x256 EXR transfer gate (before training)
+
+Run this dedicated, inference-only route before planning any training. It fixes
+the private HDR transfer contract at exactly 16 seeded lights, an external
+mask, unsigned source normals, 256x256 source geometry, one 512x512 model tile,
+bf16 precision, and CUDA. The output root is isolated from the comparison
+workflow. It uses the released LINO checkpoint and does not run training,
+`compare_sdm.py`, SDM inference, or an SDM comparison.
+
+Use the following commands from the LINO checkout:
+
+```bash
+cd /mnt/16TData/minhnv/LINO
+conda activate LINO
+python -m pip install -r requirements.txt
+
+mkdir -p checkpoints
+if [ ! -s checkpoints/lino.pth ]; then
+  wget -c \
+    "https://huggingface.co/houyuanchen/lino/resolve/main/lino.pth" \
+    -O checkpoints/lino.pth
+fi
+test -s checkpoints/lino.pth
+
+test -d /mnt/18TData/minhnv/inference
+python eval.py --config configs/lino_private_transfer.yaml
+```
+
+The successful output includes one signed prediction per object and a
+completion marker, for example:
+
+```text
+output/lino_private_transfer/external/lino/alpha.data/normal_pred.exr  # example object
+output/lino_private_transfer/external/lino/run.json
+```
+
+`normal_pred.exr` stays signed and identity-coordinate. `run.json` is created
+only after all objects finish and contains source, checkpoint, config, and
+output hashes; selected lights; per-object mask, HDR, and geometry diagnostics;
+official MAE; the constant baseline; the coordinate diagnostic; elapsed time;
+and peak CUDA memory. The 256x256 source geometry and 512x512 model geometry
+are deliberately different. The coordinate diagnostic is for convention
+diagnosis only and cannot be quoted as the official model MAE. This command is
+inference-only: it does not run `compare_sdm.py` or SDM.
+
+Interpret the transfer results with this decision table:
+
+| Observation | Decision |
+|---|---|
+| Best coordinate MAE is materially lower than identity | Resolve the coordinate convention before training. |
+| Identity is close to best and near/worse than the constant baseline | Released-checkpoint transfer failed; design LINO training/fine-tuning next. |
+| Identity clearly beats the baseline but misses the project target | Transfer is partial; use the checkpoint as the fine-tuning start. |
+| Identity is acceptable | Postpone training and design a separately controlled SDM-versus-LINO comparison. |
+
+No numeric pass threshold is imposed for this private HDR distribution.
 
 ### Where `run.json` is created
 
