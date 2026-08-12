@@ -40,6 +40,7 @@ _CONFIG_FIELDS = frozenset(
         "save_png",
     }
 )
+_OPTIONAL_CONFIG_FIELDS = frozenset({"expected_source_geometry"})
 
 
 def _require_text(value: Any, field_name: str) -> str:
@@ -88,6 +89,7 @@ class SdmExrInferenceConfig:
     num_workers: int
     save_exr: bool
     save_png: bool
+    expected_source_geometry: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         for name in ("checkpoint", "data_root", "output_root"):
@@ -109,8 +111,20 @@ class SdmExrInferenceConfig:
             raise ValueError("light_selection must be one of: seeded, manifest")
         if self.mask_policy not in {"external", "full"}:
             raise ValueError("mask_policy must be one of: external, full")
-        if self.normal_encoding != "signed":
-            raise ValueError("normal_encoding must be 'signed'")
+        if self.normal_encoding not in {"signed", "unsigned"}:
+            raise ValueError("normal_encoding must be one of: signed, unsigned")
+        if self.expected_source_geometry is not None:
+            if (
+                not isinstance(self.expected_source_geometry, tuple)
+                or len(self.expected_source_geometry) != 2
+                or any(
+                    type(value) is not int or value <= 0
+                    for value in self.expected_source_geometry
+                )
+            ):
+                raise ValueError(
+                    "expected_source_geometry must be null or a positive [height, width] pair"
+                )
         if self.precision not in {"bf16", "fp16", "fp32"}:
             raise ValueError("precision must be one of: bf16, fp16, fp32")
         if self.device not in {"auto", "cuda", "cpu"}:
@@ -195,6 +209,20 @@ def _as_normal_filenames(value: Any) -> tuple[str, ...]:
     return filenames
 
 
+def _as_optional_geometry(value: Any) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(
+            "expected_source_geometry must be null or a positive [height, width] pair"
+        )
+    height = _require_int(value[0], "expected_source_geometry height")
+    width = _require_int(value[1], "expected_source_geometry width")
+    if height <= 0 or width <= 0:
+        raise ValueError("expected_source_geometry values must be positive")
+    return (height, width)
+
+
 def load_sdm_exr_config(path: str | Path) -> SdmExrInferenceConfig:
     """Load and validate a complete SDM-EXR YAML preset.
 
@@ -215,7 +243,7 @@ def load_sdm_exr_config(path: str | Path) -> SdmExrInferenceConfig:
         invalid = ", ".join(repr(key) for key in non_string_keys)
         raise ValueError(f"configuration keys must be strings; invalid key(s): {invalid}")
 
-    unknown = sorted(set(raw_keys) - _CONFIG_FIELDS)
+    unknown = sorted(set(raw_keys) - (_CONFIG_FIELDS | _OPTIONAL_CONFIG_FIELDS))
     if unknown:
         raise ValueError(f"unknown configuration key(s): {', '.join(map(str, unknown))}")
     missing = sorted(_CONFIG_FIELDS - set(raw))
@@ -247,6 +275,7 @@ def load_sdm_exr_config(path: str | Path) -> SdmExrInferenceConfig:
         ),
         normal_filenames=_as_normal_filenames(raw["normal_filenames"]),
         normal_encoding=_require_text(raw["normal_encoding"], "normal_encoding"),
+        expected_source_geometry=_as_optional_geometry(raw.get("expected_source_geometry")),
         mask_margin=_require_int(raw["mask_margin"], "mask_margin"),
         max_image_resolution=_require_int(
             raw["max_image_resolution"], "max_image_resolution"

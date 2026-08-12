@@ -35,6 +35,7 @@ class SdmExrConfigTests(unittest.TestCase):
             "external_mask_filename": "binary_mask.exr",
             "normal_filenames": ["local_normal.exr"],
             "normal_encoding": "signed",
+            "expected_source_geometry": None,
             "mask_margin": 8,
             "max_image_resolution": 2048,
             "pixel_samples": 2048,
@@ -104,6 +105,7 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertEqual(config.external_mask_filename, "binary_mask.exr")
         self.assertEqual(config.normal_filenames, ("local_normal.exr",))
         self.assertEqual(config.normal_encoding, "signed")
+        self.assertIsNone(config.expected_source_geometry)
         self.assertEqual(config.mask_margin, 8)
         self.assertEqual(config.max_image_resolution, 2048)
         self.assertEqual(config.pixel_samples, 2048)
@@ -147,7 +149,7 @@ class SdmExrConfigTests(unittest.TestCase):
 
     def test_validation_rejects_unsupported_values_and_nonpositive_counts(self):
         cases = (
-            ("normal_encoding", "unsigned"),
+            ("normal_encoding", "octahedral"),
             ("light_selection", "random"),
             ("precision", "fp8"),
             ("device", "tpu"),
@@ -159,6 +161,31 @@ class SdmExrConfigTests(unittest.TestCase):
         for key, value in cases:
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                 self.load(**{key: value})
+
+    def test_signed_and_unsigned_encodings_are_explicitly_supported(self):
+        self.assertEqual(self.load(normal_encoding="signed").normal_encoding, "signed")
+        self.assertEqual(self.load(normal_encoding="unsigned").normal_encoding, "unsigned")
+
+    def test_expected_source_geometry_is_optional_and_strictly_positive_hw(self):
+        self.assertIsNone(self.load(expected_source_geometry=None).expected_source_geometry)
+        self.assertEqual(
+            self.load(expected_source_geometry=[256, 256]).expected_source_geometry,
+            (256, 256),
+        )
+        for invalid in ([256], [256, 256, 3], [0, 256], [True, 256], "256x256"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "expected_source_geometry"
+            ):
+                self.load(expected_source_geometry=invalid)
+
+    def test_older_yaml_without_expected_source_geometry_defaults_to_none(self):
+        from src.comparison.config import load_sdm_exr_config
+
+        values = self.complete_values()
+        values.pop("expected_source_geometry")
+        path = self.root / "older-config.yaml"
+        path.write_text(yaml.safe_dump(values, sort_keys=False), encoding="utf-8")
+        self.assertIsNone(load_sdm_exr_config(path).expected_source_geometry)
 
     def test_nonempty_string_fields_and_normal_filenames_are_required(self):
         for key in ("object_suffix", "image_prefix", "image_extension", "external_mask_filename"):

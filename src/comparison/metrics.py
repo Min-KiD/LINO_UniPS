@@ -27,6 +27,7 @@ from .manifest import (
     build_dataset_manifest,
     load_dataset_manifest,
 )
+from .normal_contract import decode_ground_truth_normal
 from .provenance import (
     atomic_create_json,
     directory_identity,
@@ -1068,7 +1069,15 @@ def load_source_gt(
     raw = _read_regular_file_once(source, label=f"source GT normal for {record.name}")
     if sha256_bytes(raw) != record.normal_sha256:
         raise ValueError(f"source GT digest mismatch for {record.name}")
-    gt = read_signed_normal_exr_bytes(raw, label=f"source GT normal for {record.name}")
+    encoded_gt = read_signed_normal_exr_bytes(
+        raw,
+        label=f"source GT normal for {record.name}",
+    )
+    gt = decode_ground_truth_normal(
+        encoded_gt,
+        config.normal_encoding,
+        label=f"source GT normal for {record.name}",
+    )
     if gt.shape != (record.height, record.width, 3):
         raise ValueError(
             f"source GT geometry mismatch for {record.name}: {gt.shape} != "

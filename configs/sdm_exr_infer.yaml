@@ -16,6 +16,7 @@ external_mask_filename: "binary_mask.exr" # External model-input mask basename.
 normal_filenames:
   - "local_normal.exr" # Ground-truth normal basename; hidden from model/SDM inputs.
 normal_encoding: "signed" # Normal EXR channels are signed vectors in [-1, 1].
+expected_source_geometry: null # General comparison route accepts each manifest's native geometry.
 mask_margin: 8 # ROI margin used by the released LINO preprocessing.
 max_image_resolution: 2048 # Must be a positive multiple of LINO's 512-pixel tile size.
 pixel_samples: 2048 # LINO decoder/pixel-chunk setting; SDM reads baseline_optimized_infer.yaml's separate value (the printed command does not override it).
