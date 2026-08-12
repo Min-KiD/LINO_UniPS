@@ -49,3 +49,26 @@ def make_object(root: Path, name: str, image_count: int = 4) -> Path:
     mask = np.ones((height, width), np.float32)
     write_mask_exr(object_dir / "binary_mask.exr", mask)
     return object_dir
+
+
+def make_unsigned_object(root: Path, name: str, image_count: int = 4) -> Path:
+    """Create a tiny HDR object with unsigned GT, valid support, and one mask halo pixel."""
+
+    object_dir = root / name
+    object_dir.mkdir(parents=True, exist_ok=True)
+    height, width = 2, 3
+    for index in range(image_count):
+        image = np.zeros((height, width, 3), np.float32)
+        image[..., 0] = 2.0 + index
+        image[..., 1] = 20.0 + index
+        image[..., 2] = 200.0 + index
+        image[0, 0, 2] = 1234.0 + index
+        write_rgb_exr(object_dir / f"image_{index:03d}.exr", image)
+
+    encoded = np.full((height, width, 3), 0.5, dtype=np.float32)
+    encoded[:, :2, 2] = 1.0
+    write_rgb_exr(object_dir / "local_normal.exr", encoded)
+
+    mask = np.asarray([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]], dtype=np.float32)
+    write_mask_exr(object_dir / "binary_mask.exr", mask)
+    return object_dir
