@@ -10,7 +10,13 @@ import numpy as np
 
 from src.comparison.config import SdmExrInferenceConfig
 from src.comparison.manifest import build_dataset_manifest
-from src.comparison.transfer_gate import preflight_transfer_sources
+from src.comparison.metrics import angular_metrics
+from src.comparison.transfer_gate import (
+    constant_front_facing_mae,
+    coordinate_transform_maes,
+    preflight_transfer_sources,
+    summarize_transfer_metrics,
+)
 from tests.comparison_helpers import (
     make_unsigned_object,
     write_mask_exr,
@@ -118,3 +124,70 @@ class PrivateTransferGateTests(unittest.TestCase):
         manifest = build_dataset_manifest(config)
         with self.assertRaisesRegex(ValueError, "unsigned values"):
             preflight_transfer_sources(config, manifest)
+
+    def test_coordinate_sweep_finds_known_permutation_and_sign_without_mutation(self):
+        gt = np.asarray(
+            [
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]],
+            ],
+            dtype=np.float32,
+        )
+        gt /= np.linalg.norm(gt, axis=2, keepdims=True)
+        prediction = gt[..., [1, 0, 2]] * np.asarray([-1.0, 1.0, 1.0], np.float32)
+        before = prediction.copy()
+        support = np.ones(gt.shape[:2], dtype=bool)
+
+        sweep = coordinate_transform_maes(gt, prediction, support)
+        summary = summarize_transfer_metrics(
+            [angular_metrics(gt, prediction, support)["mae"]],
+            [constant_front_facing_mae(gt, support)],
+            [sweep],
+        )
+
+        self.assertEqual(len(sweep), 48)
+        self.assertEqual(summary["best_coordinate_transform"]["label"], "+y,-x,+z")
+        self.assertAlmostEqual(summary["best_coordinate_macro_mae"], 0.0, places=6)
+        self.assertGreater(summary["identity_macro_mae"], 1.0)
+        np.testing.assert_array_equal(prediction, before)
+
+    def test_identity_is_retained_for_official_mae_even_when_diagnostic_is_better(self):
+        gt = np.asarray([[[1.0, 0.0, 0.0]]], dtype=np.float32)
+        prediction = np.asarray([[[0.0, 1.0, 0.0]]], dtype=np.float32)
+        support = np.ones((1, 1), dtype=bool)
+        identity = angular_metrics(gt, prediction, support)["mae"]
+        summary = summarize_transfer_metrics(
+            [identity],
+            [constant_front_facing_mae(gt, support)],
+            [coordinate_transform_maes(gt, prediction, support)],
+        )
+        self.assertEqual(identity, 90.0)
+        self.assertEqual(summary["identity_macro_mae"], 90.0)
+        self.assertEqual(summary["best_coordinate_macro_mae"], 0.0)
+
+    def test_constant_baseline_is_recomputed_and_macro_object_weighted(self):
+        support = np.ones((1, 1), dtype=bool)
+        plus_z = np.asarray([[[0.0, 0.0, 1.0]]], dtype=np.float32)
+        plus_x = np.asarray([[[1.0, 0.0, 0.0]]], dtype=np.float32)
+        baseline_maes = [
+            constant_front_facing_mae(plus_z, support),
+            constant_front_facing_mae(plus_x, support),
+        ]
+        identity_sweeps = [
+            coordinate_transform_maes(plus_z, plus_z, support),
+            coordinate_transform_maes(plus_x, plus_x, support),
+        ]
+        summary = summarize_transfer_metrics([0.0, 0.0], baseline_maes, identity_sweeps)
+        self.assertAlmostEqual(summary["constant_normal_macro_mae"], 45.0, places=6)
+
+    def test_transfer_summary_rejects_unpaired_objects_and_transform_sets(self):
+        gt = np.asarray([[[0.0, 0.0, 1.0]]], dtype=np.float32)
+        support = np.ones((1, 1), dtype=bool)
+        sweep = coordinate_transform_maes(gt, gt, support)
+        with self.assertRaisesRegex(ValueError, "equally sized"):
+            summarize_transfer_metrics([0.0, 1.0], [0.0], [sweep])
+
+        malformed = dict(sweep)
+        malformed.pop(next(reversed(malformed)))
+        with self.assertRaisesRegex(ValueError, "canonical 48"):
+            summarize_transfer_metrics([0.0], [0.0], [malformed])

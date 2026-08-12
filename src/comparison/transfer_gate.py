@@ -155,4 +155,83 @@ def preflight_transfer_sources(
     return reports
 
 
-__all__ = ["preflight_transfer_sources"]
+_AXIS_NAMES = ("x", "y", "z")
+
+
+def _coordinate_specs() -> tuple[tuple[str, tuple[int, int, int], tuple[int, int, int]], ...]:
+    specs = []
+    for permutation in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            label = ",".join(
+                f"{'+' if sign > 0 else '-'}{_AXIS_NAMES[index]}"
+                for index, sign in zip(permutation, signs)
+            )
+            specs.append((label, permutation, signs))
+    identity = ("+x,+y,+z", (0, 1, 2), (1, 1, 1))
+    return (identity,) + tuple(spec for spec in specs if spec != identity)
+
+
+_COORDINATE_SPECS = _coordinate_specs()
+
+
+def coordinate_transform_maes(gt: Any, prediction: Any, support: Any) -> dict[str, float]:
+    prediction_array = np.asarray(prediction)
+    results: dict[str, float] = {}
+    for label, permutation, signs in _COORDINATE_SPECS:
+        transformed = np.take(prediction_array, permutation, axis=2) * np.asarray(
+            signs, dtype=np.float64
+        )
+        results[label] = float(angular_metrics(gt, transformed, support)["mae"])
+    return results
+
+
+def constant_front_facing_mae(gt: Any, support: Any) -> float:
+    gt_array = np.asarray(gt)
+    baseline = np.zeros(gt_array.shape, dtype=np.float32)
+    baseline[..., 2] = 1.0
+    return float(angular_metrics(gt_array, baseline, support)["mae"])
+
+
+def _transform_payload(label: str) -> dict[str, Any]:
+    for candidate, permutation, signs in _COORDINATE_SPECS:
+        if candidate == label:
+            return {
+                "label": candidate,
+                "permutation": [_AXIS_NAMES[index] for index in permutation],
+                "signs": list(signs),
+            }
+    raise ValueError(f"unknown coordinate transform: {label}")
+
+
+def summarize_transfer_metrics(
+    identity_maes: Sequence[float],
+    baseline_maes: Sequence[float],
+    coordinate_sweeps: Sequence[Mapping[str, float]],
+) -> dict[str, Any]:
+    object_count = len(identity_maes)
+    if object_count == 0 or len(baseline_maes) != object_count or len(coordinate_sweeps) != object_count:
+        raise ValueError("transfer metric sequences must be nonempty and equally sized")
+    expected_labels = tuple(label for label, _, _ in _COORDINATE_SPECS)
+    if any(tuple(sweep) != expected_labels for sweep in coordinate_sweeps):
+        raise ValueError("coordinate sweeps must contain the canonical 48 transforms in order")
+    macro_by_transform = {
+        label: float(sum(float(sweep[label]) for sweep in coordinate_sweeps) / object_count)
+        for label in expected_labels
+    }
+    best_label = min(expected_labels, key=lambda label: macro_by_transform[label])
+    return {
+        "object_count": object_count,
+        "identity_macro_mae": float(sum(map(float, identity_maes)) / object_count),
+        "constant_normal_macro_mae": float(sum(map(float, baseline_maes)) / object_count),
+        "best_coordinate_macro_mae": macro_by_transform[best_label],
+        "best_coordinate_transform": _transform_payload(best_label),
+        "evaluated_coordinate_transform_count": len(expected_labels),
+    }
+
+
+__all__ = [
+    "preflight_transfer_sources",
+    "coordinate_transform_maes",
+    "constant_front_facing_mae",
+    "summarize_transfer_metrics",
+]
