@@ -13,6 +13,13 @@ class InferenceReportingTests(unittest.TestCase):
         self.assertEqual(format_clock_duration(125.4), "00:02:05")
         self.assertEqual(format_clock_duration(90061.0), "25:01:01")
 
+    def test_optional_cuda_bytes_are_reported_in_gib(self):
+        from src.comparison.reporting import format_optional_gib
+
+        self.assertEqual(format_optional_gib(None), "unavailable")
+        self.assertEqual(format_optional_gib(0), "0.00 GiB")
+        self.assertEqual(format_optional_gib(1536 * 1024 * 1024), "1.50 GiB")
+
     def test_progress_reports_first_hundreds_and_final(self):
         reported = [
             index

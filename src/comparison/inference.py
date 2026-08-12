@@ -47,7 +47,14 @@ from .metrics import angular_metrics, load_source_gt, normal_validity_mask
 from .reporting import (
     estimate_eta_seconds,
     format_clock_duration,
+    format_optional_gib,
     should_report_progress,
+)
+from .transfer_gate import (
+    constant_front_facing_mae,
+    coordinate_transform_maes,
+    preflight_transfer_sources,
+    summarize_transfer_metrics,
 )
 
 
@@ -686,6 +693,7 @@ def _run_lino_inference_pinned(
     config_digest: str | None,
     selection_source_bytes: bytes | None,
     clock: Callable[[], float],
+    total_started: float,
 ) -> dict[str, Any]:
     (
         policy_fd,
@@ -713,6 +721,9 @@ def _run_lino_inference_pinned(
         require_run=False,
     )
     _invalidate_lino_run(lino_fd)
+    preflight_report = preflight_transfer_sources(config, manifest)
+    if tuple(preflight_report) != tuple(record.name for record in manifest.objects):
+        raise ValueError("preflight object order does not match the manifest")
     _, canonical_selection, input_digest, selection_digest, canonical_digest = _persist_manifests(
         config,
         manifest,
@@ -756,6 +767,9 @@ def _run_lino_inference_pinned(
     started = clock()
     last_object_finished = started
     object_records: list[dict[str, Any]] = []
+    identity_maes: list[float] = []
+    baseline_maes: list[float] = []
+    coordinate_sweeps: list[dict[str, float]] = []
 
     for index, record in enumerate(manifest.objects):
         object_started = clock()
@@ -771,6 +785,16 @@ def _run_lino_inference_pinned(
             raise ValueError(
                 f"dataset object order/name mismatch: expected {record.name}, got {object_name}"
             )
+        model_geometry = metadata.get("resized_geometry")
+        if (
+            not isinstance(model_geometry, Mapping)
+            or set(model_geometry) != {"height", "width"}
+            or type(model_geometry["height"]) is not int
+            or type(model_geometry["width"]) is not int
+            or model_geometry["height"] <= 0
+            or model_geometry["width"] <= 0
+        ):
+            raise ValueError(f"model geometry is invalid for {record.name}")
 
         model_batch = _model_batch_on_device(batch, device)
         with torch.inference_mode():
@@ -822,6 +846,34 @@ def _run_lino_inference_pinned(
                 scored_prediction,
                 support,
             )
+            identity_mae = float(object_metrics["mae"])
+            baseline_mae = constant_front_facing_mae(source_gt, support)
+            coordinate_sweep = coordinate_transform_maes(
+                source_gt,
+                scored_prediction,
+                support,
+            )
+            object_coordinate_summary = summarize_transfer_metrics(
+                [identity_mae],
+                [baseline_mae],
+                [coordinate_sweep],
+            )
+            identity_maes.append(identity_mae)
+            baseline_maes.append(baseline_mae)
+            coordinate_sweeps.append(coordinate_sweep)
+            source_report = dict(preflight_report[record.name])
+            transfer_diagnostics = {
+                **source_report,
+                "model_geometry": dict(model_geometry),
+                "identity_mae": identity_mae,
+                "constant_normal_mae": baseline_mae,
+                "best_coordinate_mae": object_coordinate_summary[
+                    "best_coordinate_macro_mae"
+                ],
+                "best_coordinate_transform": object_coordinate_summary[
+                    "best_coordinate_transform"
+                ],
+            }
             _write_bytes_at_fd(
                 object_fd,
                 "normal_pred.exr",
@@ -878,8 +930,9 @@ def _run_lino_inference_pinned(
                 "output_path": str(exr_path) if config.save_exr else None,
                 "preview_path": str(png_path) if config.save_png else None,
                 "output_sha256": output_digest,
-                "mae": float(object_metrics["mae"]),
+                "mae": identity_mae,
                 "valid_pixel_count": int(object_metrics["valid_pixel_count"]),
+                "transfer_diagnostics": _json_safe(transfer_diagnostics),
             }
         )
         completed = index + 1
@@ -902,9 +955,20 @@ def _run_lino_inference_pinned(
         peak_reserved = None
 
     repo_root = Path(__file__).resolve().parents[2]
-    mean_mae = float(
-        sum(float(item["mae"]) for item in object_records) / len(object_records)
+    transfer_summary = summarize_transfer_metrics(
+        identity_maes,
+        baseline_maes,
+        coordinate_sweeps,
     )
+    mean_mae = float(sum(identity_maes) / len(identity_maes))
+    if not np.isclose(
+        mean_mae,
+        transfer_summary["identity_macro_mae"],
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError("official MAE and transfer identity summary diverged")
+    total_runtime_seconds = max(0.0, float(clock() - total_started))
     provenance: dict[str, Any] = {
         "model": "LINO-UniPS",
         "config_path": str(config_file_path.resolve(strict=True)) if config_file_path else None,
@@ -916,6 +980,7 @@ def _run_lino_inference_pinned(
         "preprocessing": lino_preprocessing_snapshot(config),
         "repository_commit": _repository_commit(repo_root),
         "mask_policy": config.mask_policy,
+        "normal_encoding": config.normal_encoding,
         "input_manifest_sha256": input_digest,
         "selection_manifest_sha256": selection_digest,
         "effective_selection_manifest_sha256": canonical_digest,
@@ -931,6 +996,8 @@ def _run_lino_inference_pinned(
         "runtime_seconds": runtime_seconds,
         "peak_cuda_allocated_bytes": peak_allocated,
         "peak_cuda_reserved_bytes": peak_reserved,
+        "transfer_summary": transfer_summary,
+        "total_runtime_seconds": total_runtime_seconds,
     }
     serialized_provenance = (
         json.dumps(
@@ -1060,13 +1127,30 @@ def run_lino_inference(
             config_digest=config_digest,
             selection_source_bytes=selection_source_bytes,
             clock=clock,
+            total_started=total_started,
         )
-    total_runtime_seconds = clock() - total_started
     print(
         f"Inference complete: {len(manifest.objects)} objects -> "
         f"{config.lino_output_dir}"
     )
     print(f"Mean MAE ({result['mae_objects']} objects): {result['mean_mae']:.4f}")
+    transfer = result["transfer_summary"]
+    print(
+        "Constant [0,0,1] baseline MAE: "
+        f"{transfer['constant_normal_macro_mae']:.4f}"
+    )
+    print(
+        "Best coordinate diagnostic: "
+        f"{transfer['best_coordinate_transform']['label']} | "
+        f"MAE {transfer['best_coordinate_macro_mae']:.4f}"
+    )
+    print(
+        "Peak CUDA memory: allocated "
+        f"{format_optional_gib(result['peak_cuda_allocated_bytes'])} | "
+        "reserved "
+        f"{format_optional_gib(result['peak_cuda_reserved_bytes'])}"
+    )
+    total_runtime_seconds = float(result["total_runtime_seconds"])
     print(f"Total inference time: {format_clock_duration(total_runtime_seconds)}")
     return result
 

@@ -8,6 +8,14 @@ def format_clock_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def format_optional_gib(value: int | None) -> str:
+    if value is None:
+        return "unavailable"
+    if type(value) is not int or value < 0:
+        raise ValueError("memory byte count must be a non-negative integer or null")
+    return f"{value / (1024 ** 3):.2f} GiB"
+
+
 def should_report_progress(
     completed: int,
     total: int,

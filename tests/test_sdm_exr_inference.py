@@ -24,7 +24,12 @@ from src.comparison.config import SdmExrInferenceConfig
 from src.comparison.exr_io import read_rgb_exr, sha256_file
 import src.comparison.inference as inference
 from src.comparison.inference import load_local_lino_checkpoint, run_lino_inference
-from tests.comparison_helpers import make_object, write_rgb_exr
+from tests.comparison_helpers import (
+    make_object,
+    make_unsigned_object,
+    write_mask_exr,
+    write_rgb_exr,
+)
 
 
 class _StubModel(torch.nn.Module):
@@ -55,8 +60,27 @@ class _StubModel(torch.nn.Module):
             raise AssertionError("roi must remain on CPU")
         if batch["mask_original"].device.type != "cpu":
             raise AssertionError("mask_original must remain on CPU")
-        if "nml" in batch or "normal" in batch or "ground_truth" in batch:
-            raise AssertionError("ground truth leaked into model batch")
+        for forbidden in (
+            "nml",
+            "normal",
+            "ground_truth",
+            "source_gt",
+            "transfer_diagnostics",
+        ):
+            if forbidden in batch:
+                raise AssertionError(f"ground truth leaked into model batch: {forbidden}")
+
+
+class _PositiveZStub(_StubModel):
+    def forward(self, batch):
+        self.calls.append(batch)
+        self.assert_batch_has_no_ground_truth(batch)
+        metadata = batch["metadata"]
+        height = int(metadata["source_geometry"]["height"])
+        width = int(metadata["source_geometry"]["width"])
+        output = np.zeros((height, width, 3), dtype=np.float32)
+        output[..., 2] = 1.0
+        return output
 
 
 class SdmExrInferenceTests(unittest.TestCase):
@@ -201,6 +225,137 @@ class SdmExrInferenceTests(unittest.TestCase):
         self.assertIn("Mean MAE (2 objects): 90.0000", output)
         self.assertIn("Total inference time: 00:00:45", output)
         self.assertAlmostEqual(result["mean_mae"], 90.0, places=5)
+
+    def test_private_preflight_failure_happens_before_dataset_and_model_construction(self):
+        object_dir = make_unsigned_object(self.data_root, "alpha.data")
+        mask = np.zeros((2, 3), dtype=np.float32)
+        mask[0, 0] = 1.0
+        write_mask_exr(object_dir / "binary_mask.exr", mask)
+        config = self.config(
+            normal_encoding="unsigned",
+            expected_source_geometry=(2, 3),
+        )
+        model_called = False
+        dataset_called = False
+
+        def model_loader(*_args):
+            nonlocal model_called
+            model_called = True
+            raise AssertionError("model loader must not run")
+
+        def dataset_factory(*_args):
+            nonlocal dataset_called
+            dataset_called = True
+            raise AssertionError("dataset factory must not run")
+
+        with self.assertRaisesRegex(ValueError, "GT-valid.*outside.*mask"):
+            run_lino_inference(
+                config,
+                model_loader=model_loader,
+                dataset_factory=dataset_factory,
+            )
+        self.assertFalse(model_called)
+        self.assertFalse(dataset_called)
+        self.assertFalse(config.provenance_path.exists())
+
+    def test_private_preflight_failure_invalidates_an_older_run_record(self):
+        object_dir = make_unsigned_object(self.data_root, "alpha.data")
+        config = self.config(
+            normal_encoding="unsigned",
+            expected_source_geometry=(2, 3),
+        )
+        run_lino_inference(config, model_loader=lambda *_args: _PositiveZStub([]))
+        self.assertTrue(config.provenance_path.is_file())
+
+        mask = np.zeros((2, 3), dtype=np.float32)
+        mask[0, 0] = 1.0
+        write_mask_exr(object_dir / "binary_mask.exr", mask)
+        with self.assertRaisesRegex(ValueError, "GT-valid.*outside.*mask"):
+            run_lino_inference(
+                config,
+                model_loader=lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("model loader must not run")
+                ),
+            )
+        self.assertFalse(config.provenance_path.exists())
+
+    def test_private_transfer_run_records_geometry_diagnostics_and_macro_summary(self):
+        make_unsigned_object(self.data_root, "alpha.data")
+        make_unsigned_object(self.data_root, "zeta.data")
+        config = self.config(
+            normal_encoding="unsigned",
+            expected_source_geometry=(2, 3),
+        )
+        calls: list[dict] = []
+        result = run_lino_inference(
+            config,
+            model_loader=lambda *_args: _PositiveZStub(calls),
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertAlmostEqual(result["mean_mae"], 0.0, places=5)
+        self.assertEqual(result["transfer_summary"]["identity_macro_mae"], result["mean_mae"])
+        self.assertAlmostEqual(
+            result["transfer_summary"]["constant_normal_macro_mae"],
+            0.0,
+            places=5,
+        )
+        self.assertEqual(
+            result["transfer_summary"]["best_coordinate_transform"]["label"],
+            "+x,+y,+z",
+        )
+        self.assertEqual(
+            result["transfer_summary"]["evaluated_coordinate_transform_count"],
+            48,
+        )
+        self.assertGreaterEqual(result["total_runtime_seconds"], 0.0)
+        for item in result["objects"]:
+            diagnostics = item["transfer_diagnostics"]
+            self.assertEqual(diagnostics["source_geometry"], {"height": 2, "width": 3})
+            self.assertEqual(diagnostics["model_geometry"], {"height": 512, "width": 512})
+            self.assertEqual(diagnostics["decoded_gt_valid_pixel_count"], 4)
+            self.assertEqual(diagnostics["external_mask_pixel_count"], 5)
+            self.assertEqual(diagnostics["mask_only_pixel_count"], 1)
+            self.assertTrue(
+                any(value["maximum"] > 1000.0 for value in diagnostics["selected_observations"])
+            )
+            prediction = read_rgb_exr(
+                config.lino_output_dir / item["object_name"] / "normal_pred.exr"
+            )
+            np.testing.assert_allclose(prediction[..., 2], 1.0, atol=1.0e-6)
+            np.testing.assert_allclose(prediction[..., :2], 0.0, atol=1.0e-6)
+
+        written = json.loads(config.provenance_path.read_text(encoding="utf-8"))
+        self.assertEqual(written, result)
+
+    def test_private_transfer_console_reports_gate_summary(self):
+        make_unsigned_object(self.data_root, "alpha.data")
+        make_unsigned_object(self.data_root, "zeta.data")
+        config = self.config(
+            normal_encoding="unsigned",
+            expected_source_geometry=(2, 3),
+        )
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            run_lino_inference(
+                config,
+                model_loader=lambda *_args: _PositiveZStub([]),
+            )
+        output = stdout.getvalue()
+        self.assertIn(f"Exploring {config.data_root}", output)
+        self.assertIn("Found 2 objects!", output)
+        self.assertIn("Using device: cpu", output)
+        self.assertIn("LINO progress: 1/2", output)
+        self.assertIn("LINO progress: 2/2", output)
+        self.assertIn(f"Inference complete: 2 objects -> {config.lino_output_dir}", output)
+        self.assertIn("Mean MAE (2 objects): 0.0000", output)
+        self.assertIn("Constant [0,0,1] baseline MAE: 0.0000", output)
+        self.assertIn("Best coordinate diagnostic: +x,+y,+z | MAE 0.0000", output)
+        self.assertIn(
+            "Peak CUDA memory: allocated unavailable | reserved unavailable",
+            output,
+        )
+        self.assertIn("Total inference time:", output)
 
     def test_failed_run_never_prints_completion_summary(self):
         self.make_dataset("alpha.data")
