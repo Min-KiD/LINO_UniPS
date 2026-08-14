@@ -55,12 +55,17 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=2, gamma=0.5)
         self.contract = {
             "schema_version": 1,
+            "artifact_kind": "lino_private_training_contract",
             "run_kind": "experiment",
             "comparable": True,
             "total_epochs": 4,
             "architecture_schema_sha256": "schema",
             "train_manifest_sha256": "train",
             "test_manifest_sha256": "test",
+            "final_selection_manifest_sha256": "final",
+            "source_revision": "source",
+            "runtime_versions": {"python": "test"},
+            "config_snapshot": {"seed": 7},
         }
 
     def tearDown(self) -> None:
@@ -156,6 +161,27 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
         self.assertEqual(sidecar["artifact_kind"], "lino_private_inference_weights")
         self.assertEqual(sidecar["checkpoint_sha256"], export.checkpoint_sha256)
 
+    def test_export_pair_rolls_back_when_sidecar_publication_fails(self) -> None:
+        weights = self.root / "lino_epoch_006.pth"
+        sidecar = weights.with_suffix(".json")
+        weights.write_bytes(b"old-weights")
+        sidecar.write_bytes(b"old-sidecar")
+        original_publish = __import__("src.training.checkpointing", fromlist=["publish_epoch_artifacts"]).publish_epoch_artifacts
+        with mock.patch(
+            "src.training.checkpointing.publish_epoch_artifacts",
+            side_effect=OSError("sidecar publication failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "sidecar publication"):
+                export_inference_weights(
+                    weights,
+                    model=self.model,
+                    model_factory=_TinyReleasedModel,
+                    metadata={"epoch": 6},
+                )
+        self.assertEqual(weights.read_bytes(), b"old-weights")
+        self.assertEqual(sidecar.read_bytes(), b"old-sidecar")
+        self.assertIsNotNone(original_publish)
+
     def test_initialization_allows_only_the_four_author_extras(self) -> None:
         state = {name: tensor.detach().clone() for name, tensor in self.model.state_dict().items()}
         state[next(iter(ALLOWED_AUTHOR_EXTRAS))] = torch.ones(1)
@@ -197,6 +223,79 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
                 expected_contract=self.contract,
             )
         self.assertTrue(torch.equal(self.model.linear.weight, self.model.linear.weight.detach()))
+
+    def test_preflight_payload_mutation_cannot_change_authoritative_load(self) -> None:
+        path = self.root / "author.pth"
+        expected = self.model.linear.weight.detach().clone()
+        torch.save(self.model.state_dict(), path)
+        preflight = preflight_startup_checkpoint(
+            "init_checkpoint",
+            path,
+            expected_schema=self.model,
+            expected_contract=self.contract,
+        )
+        payload = preflight.payload
+        assert payload is not None
+        state = payload["state_dict"]
+        state["linear.weight"].add_(100)
+        load_initial_weights(preflight, model=self.model)
+        self.assertTrue(torch.equal(self.model.linear.weight, expected))
+
+    def test_preflight_rejects_symlinked_intermediate_checkpoint_path(self) -> None:
+        real_root = self.root / "real"
+        real_root.mkdir()
+        checkpoint = real_root / "model.pth"
+        torch.save(self.model.state_dict(), checkpoint)
+        (self.root / "link").symlink_to(real_root, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink|regular|checkpoint"):
+            preflight_startup_checkpoint(
+                "init_checkpoint",
+                self.root / "link" / "model.pth",
+                expected_schema=self.model,
+                expected_contract=self.contract,
+            )
+
+    def test_preflight_rejects_model_state_dtype_mismatch(self) -> None:
+        path = self.root / "dtype.pth"
+        state = {name: tensor.detach().double() for name, tensor in self.model.state_dict().items()}
+        torch.save(state, path)
+        with self.assertRaisesRegex(ValueError, "dtype"):
+            preflight_startup_checkpoint(
+                "init_checkpoint",
+                path,
+                expected_schema=self.model,
+                expected_contract=self.contract,
+            )
+
+    def test_preflight_rejects_malformed_optimizer_scheduler_and_rng(self) -> None:
+        checkpoint = self.root / "valid.ckpt"
+        save_resume_checkpoint(
+            checkpoint,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            progress=TrainingProgress(0, 1, 0),
+            best=BestMetrics(float("inf"), float("inf"), 0),
+            contract=self.contract,
+        )
+        valid = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        malformed = (
+            ("optimizer_state_dict", "bad"),
+            ("scheduler_state_dict", []),
+            ("rng_state", {"python": "bad", "numpy": (), "torch": torch.tensor([1]), "cuda": []}),
+        )
+        for field, value in malformed:
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(valid)
+                candidate[field] = value
+                torch.save(candidate, checkpoint)
+                with self.assertRaisesRegex(ValueError, field.split("_")[0] + "|rng"):
+                    preflight_startup_checkpoint(
+                        "resume",
+                        checkpoint,
+                        expected_schema=self.model,
+                        expected_contract=self.contract,
+                    )
 
     def test_contract_allows_only_increased_total_epochs(self) -> None:
         current = dict(self.contract)
@@ -255,6 +354,31 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
         self.assertEqual((run / "last.ckpt").read_bytes(), b"old-last")
         self.assertEqual((run / "metrics.csv").read_bytes(), b"old-metrics")
         self.assertFalse((run / "epoch_002.ckpt").exists())
+
+    def test_backup_cleanup_failure_is_postcommit_and_never_partial(self) -> None:
+        run = self.root / "run-cleanup"
+        run.mkdir()
+        (run / "last.ckpt").write_bytes(b"old-last")
+        (run / "metrics.csv").write_bytes(b"old-metrics")
+        checkpoint = _state_bytes({"artifact_kind": "lino_private_training_checkpoint"})
+        original_unlink = __import__("src.training.checkpointing", fromlist=["os"]).os.unlink
+        calls = {"count": 0}
+
+        def fail_second_backup_unlink(path, *args, **kwargs):
+            if isinstance(path, str) and path.endswith(".bak"):
+                calls["count"] += 1
+                if calls["count"] == 2:
+                    raise OSError("backup cleanup failure")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch("src.training.checkpointing.os.unlink", side_effect=fail_second_backup_unlink):
+            result = publish_epoch_artifacts(
+                run,
+                artifacts={"last.ckpt": checkpoint, "metrics.csv": b"new-metrics"},
+            )
+        self.assertEqual(set(result), {"last.ckpt", "metrics.csv"})
+        self.assertNotEqual((run / "last.ckpt").read_bytes(), b"old-last")
+        self.assertEqual((run / "metrics.csv").read_bytes(), b"new-metrics")
 
     def test_retention_keeps_milestones_and_latest_aliases(self) -> None:
         run = self.root / "run"

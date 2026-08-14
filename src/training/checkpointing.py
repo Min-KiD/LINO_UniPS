@@ -24,7 +24,7 @@ import secrets
 import stat
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable
@@ -36,7 +36,6 @@ from src.comparison.provenance import (
     _secure_directory_flags,
     atomic_replace_bytes_at_fd,
     canonical_json_bytes,
-    directory_identity,
     ensure_real_directory,
     open_or_create_directory,
     read_regular_bytes_at_fd,
@@ -92,6 +91,10 @@ class StartupCheckpointPreflight:
     sha256: str | None
     payload: Mapping[str, object] | None
     load_report: Mapping[str, object]
+    # The parsed payload above is diagnostic only.  Loaders use this private,
+    # immutable byte snapshot and reparse it into fresh CPU objects so callers
+    # cannot mutate an already validated tensor into an authoritative state.
+    _raw_bytes: bytes | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -204,7 +207,7 @@ def _schema_check(
             "checkpoint has unexpected model keys: "
             + ", ".join(disallowed or unexpected)
         )
-    for name, (shape, _dtype) in expected_map.items():
+    for name, (shape, dtype) in expected_map.items():
         value = state[name]
         if not isinstance(value, torch.Tensor):
             raise ValueError(f"checkpoint model key {name} is not a tensor")
@@ -212,6 +215,11 @@ def _schema_check(
             raise ValueError(
                 f"checkpoint model key {name} shape mismatch: "
                 f"got {tuple(value.shape)}, expected {shape}"
+            )
+        if str(value.dtype) != dtype:
+            raise ValueError(
+                f"checkpoint model key {name} dtype mismatch: "
+                f"got {value.dtype}, expected {dtype}"
             )
         if not torch.isfinite(value).all().item():
             raise ValueError(f"checkpoint model key {name} contains non-finite values")
@@ -263,14 +271,48 @@ def _thaw(value: object) -> object:
     return copy.deepcopy(value)
 
 
+def _open_existing_directory_path(path: Path, *, label: str) -> tuple[int, dict[str, int], Path]:
+    """Open every directory component with no-follow descriptor checks."""
+
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts
+    if not parts or parts[0] != os.sep:
+        raise ValueError(f"{label} must be absolute")
+    flags = _secure_directory_flags()
+    descriptor = os.open(os.sep, flags)
+    try:
+        for component in parts[1:]:
+            info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"{label} contains a symlink or non-directory component")
+            expected = (int(info.st_dev), int(info.st_ino))
+            child = os.open(component, flags, dir_fd=descriptor)
+            child_info = os.fstat(child)
+            actual = (int(child_info.st_dev), int(child_info.st_ino))
+            if actual != expected:
+                os.close(child)
+                raise ValueError(f"{label} was replaced while opening")
+            os.close(descriptor)
+            descriptor = child
+        info = os.fstat(descriptor)
+        return descriptor, {"dev": int(info.st_dev), "ino": int(info.st_ino)}, absolute
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
 def _read_snapshot(path: Path, *, label: str) -> tuple[bytes, str]:
     path = Path(path)
     absolute = Path(os.path.abspath(path))
     parent = absolute.parent
     try:
-        parent_identity = directory_identity(parent, label=f"{label} parent directory")
-        flags = _secure_directory_flags()
-        descriptor = os.open(str(parent), flags)
+        descriptor, parent_identity, parent_absolute = _open_existing_directory_path(
+            parent,
+            label=f"{label} parent directory",
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(f"{label} is missing or unreadable: {path}") from exc
     try:
@@ -281,7 +323,7 @@ def _read_snapshot(path: Path, *, label: str) -> tuple[bytes, str]:
             absolute.name,
             expected_directory_identity=parent_identity,
             label=label,
-            directory_path=parent,
+            directory_path=parent_absolute,
         )
     except OSError as exc:
         raise ValueError(f"failed to read {label}: {path}") from exc
@@ -308,6 +350,209 @@ def _load_torch_bytes(raw: bytes, *, label: str) -> object:
     except Exception as exc:
         raise ValueError(f"failed to parse {label}") from exc
 
+
+def _validate_cpu_structure(value: object, label: str, *, _depth: int = 0) -> None:
+    """Reject arbitrary objects, non-CPU tensors, and non-finite values."""
+
+    if _depth > 32:
+        raise ValueError(f"{label} is nested too deeply")
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            raise ValueError(f"{label} tensor must be on CPU")
+        if value.is_floating_point() or value.is_complex():
+            if not torch.isfinite(value).all().item():
+                raise ValueError(f"{label} contains non-finite tensor values")
+        return
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind in "fc" and not np.isfinite(value).all():
+            raise ValueError(f"{label} contains non-finite array values")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, (str, int, float, bool, type(None))):
+                _validate_cpu_structure(item, f"{label}[{key!r}]", _depth=_depth + 1)
+            else:
+                raise ValueError(f"{label} contains an unsupported mapping key")
+        return
+    if isinstance(value, (tuple, list)):
+        for index, item in enumerate(value):
+            _validate_cpu_structure(item, f"{label}[{index}]", _depth=_depth + 1)
+        return
+    if isinstance(value, (str, bool, int)) or value is None:
+        return
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError(f"{label} contains a non-finite number")
+        return
+    raise ValueError(f"{label} contains an unsupported value type: {type(value).__name__}")
+
+
+def _validate_optimizer_state(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("optimizer_state_dict must be a mapping")
+    if set(value) != {"state", "param_groups"}:
+        raise ValueError("optimizer_state_dict must contain state and param_groups")
+    states = value["state"]
+    groups = value["param_groups"]
+    if not isinstance(states, Mapping):
+        raise ValueError("optimizer_state_dict.state must be a mapping")
+    if not isinstance(groups, (list, tuple)) or not groups:
+        raise ValueError("optimizer_state_dict.param_groups must be a nonempty list")
+    parameter_ids: list[int] = []
+    for parameter_id, state in states.items():
+        if isinstance(parameter_id, bool) or not isinstance(parameter_id, int) or parameter_id < 0:
+            raise ValueError("optimizer_state_dict.state keys must be non-negative integers")
+        if not isinstance(state, Mapping):
+            raise ValueError("optimizer_state_dict state entries must be mappings")
+        _validate_cpu_structure(state, f"optimizer_state_dict.state[{parameter_id}]")
+    for index, group in enumerate(groups):
+        if not isinstance(group, Mapping) or "params" not in group:
+            raise ValueError(f"optimizer_state_dict.param_groups[{index}] is invalid")
+        params = group["params"]
+        if not isinstance(params, (list, tuple)) or not params:
+            raise ValueError(f"optimizer_state_dict.param_groups[{index}].params is invalid")
+        for parameter_id in params:
+            if isinstance(parameter_id, bool) or not isinstance(parameter_id, int) or parameter_id < 0:
+                raise ValueError("optimizer parameter ids must be non-negative integers")
+            parameter_ids.append(parameter_id)
+        _validate_cpu_structure(group, f"optimizer_state_dict.param_groups[{index}]")
+    if len(parameter_ids) != len(set(parameter_ids)):
+        raise ValueError("optimizer parameter ids must be unique")
+    if not set(states).issubset(set(parameter_ids)):
+        raise ValueError("optimizer state contains an id absent from param_groups")
+
+
+def _validate_scheduler_state(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("scheduler_state_dict must be a mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError("scheduler_state_dict keys must be strings")
+    _validate_cpu_structure(value, "scheduler_state_dict")
+
+
+def _validate_rng_state(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"python", "numpy", "torch", "cuda"}:
+        raise ValueError("rng_state must contain python, numpy, torch, and cuda")
+    python_state = value["python"]
+    if (
+        not isinstance(python_state, tuple)
+        or len(python_state) != 3
+        or isinstance(python_state[0], bool)
+        or not isinstance(python_state[0], int)
+        or not isinstance(python_state[1], tuple)
+        or len(python_state[1]) < 2
+        or not all(isinstance(item, int) and not isinstance(item, bool) for item in python_state[1])
+        or (python_state[2] is not None and not isinstance(python_state[2], float))
+    ):
+        raise ValueError("rng_state.python has an invalid random.Random state")
+    if python_state[2] is not None and not np.isfinite(python_state[2]):
+        raise ValueError("rng_state.python gaussian cache is non-finite")
+    numpy_state = value["numpy"]
+    if (
+        not isinstance(numpy_state, tuple)
+        or len(numpy_state) != 5
+        or not isinstance(numpy_state[0], str)
+        or not isinstance(numpy_state[1], np.ndarray)
+        or numpy_state[1].dtype.kind not in "ui"
+        or numpy_state[1].ndim != 1
+        or numpy_state[1].size == 0
+        or isinstance(numpy_state[2], bool)
+        or not isinstance(numpy_state[2], int)
+        or isinstance(numpy_state[3], bool)
+        or not isinstance(numpy_state[3], (int, np.integer))
+        or isinstance(numpy_state[4], bool)
+        or not isinstance(numpy_state[4], (int, float, np.integer, np.floating))
+    ):
+        raise ValueError("rng_state.numpy has an invalid NumPy state")
+    if not np.isfinite(float(numpy_state[4])):
+        raise ValueError("rng_state.numpy cache is non-finite")
+    torch_state = value["torch"]
+    if (
+        not isinstance(torch_state, torch.Tensor)
+        or torch_state.device.type != "cpu"
+        or torch_state.dtype != torch.uint8
+        or torch_state.ndim != 1
+        or torch_state.numel() == 0
+    ):
+        raise ValueError("rng_state.torch has an invalid CPU uint8 state")
+    cuda_states = value["cuda"]
+    if not isinstance(cuda_states, (list, tuple)):
+        raise ValueError("rng_state.cuda must be a list of CPU uint8 states")
+    for index, state in enumerate(cuda_states):
+        if (
+            not isinstance(state, torch.Tensor)
+            or state.device.type != "cpu"
+            or state.dtype != torch.uint8
+            or state.ndim != 1
+            or state.numel() == 0
+        ):
+            raise ValueError(f"rng_state.cuda[{index}] has an invalid CPU uint8 state")
+
+
+_REQUIRED_CONTRACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "artifact_kind",
+        "run_kind",
+        "comparable",
+        "total_epochs",
+        "architecture_schema_sha256",
+        "train_manifest_sha256",
+        "test_manifest_sha256",
+        "final_selection_manifest_sha256",
+        "source_revision",
+        "runtime_versions",
+        "config_snapshot",
+    }
+)
+
+
+def _validate_run_contract(value: object) -> Mapping[str, object]:
+    contract = _as_mapping(value, "run_contract")
+    missing = sorted(_REQUIRED_CONTRACT_KEYS - set(contract))
+    if missing:
+        raise ValueError(f"run_contract is missing required fields: {', '.join(missing)}")
+    if contract["schema_version"] != _CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("run_contract schema_version is invalid")
+    if contract["artifact_kind"] != _CONTRACT_ARTIFACT:
+        raise ValueError("run_contract artifact_kind is invalid")
+    if contract["run_kind"] not in {"experiment", "smoke"}:
+        raise ValueError("run_contract run_kind is invalid")
+    if not isinstance(contract["comparable"], bool):
+        raise ValueError("run_contract comparable must be boolean")
+    if contract["run_kind"] == "smoke" and contract["comparable"]:
+        raise ValueError("smoke run_contract cannot be comparable")
+    total_epochs = contract["total_epochs"]
+    if isinstance(total_epochs, bool) or not isinstance(total_epochs, int) or total_epochs <= 0:
+        raise ValueError("run_contract total_epochs must be positive")
+    for key in (
+        "architecture_schema_sha256",
+        "train_manifest_sha256",
+        "test_manifest_sha256",
+        "final_selection_manifest_sha256",
+        "source_revision",
+    ):
+        if not isinstance(contract[key], str) or not contract[key]:
+            raise ValueError(f"run_contract {key} must be a non-empty string")
+    if not isinstance(contract["runtime_versions"], Mapping):
+        raise ValueError("run_contract runtime_versions must be a mapping")
+    if not isinstance(contract["config_snapshot"], Mapping):
+        raise ValueError("run_contract config_snapshot must be a mapping")
+    return contract
+
+
+def _fresh_preflight_payload(preflight: StartupCheckpointPreflight) -> Mapping[str, object]:
+    """Reparse private preflight bytes into fresh CPU objects at load time."""
+
+    if preflight._raw_bytes is None:
+        if preflight.payload is None:
+            raise ValueError("checkpoint preflight has no private byte snapshot")
+        return _as_mapping(preflight.payload, "checkpoint preflight payload")
+    digest = sha256_bytes(preflight._raw_bytes)
+    if preflight.sha256 != digest:
+        raise ValueError("checkpoint preflight byte snapshot digest changed")
+    payload = _load_torch_bytes(preflight._raw_bytes, label="private training checkpoint snapshot")
+    return _as_mapping(payload, "checkpoint preflight payload")
 
 def _validate_progress(value: object) -> TrainingProgress:
     mapping = _as_mapping(value, "progress")
@@ -422,8 +667,10 @@ def build_run_contract(
         if base_contract is not None
         else {}
     )
-    contract.setdefault("schema_version", _CHECKPOINT_SCHEMA_VERSION)
-    contract.setdefault("artifact_kind", _CONTRACT_ARTIFACT)
+    # These fields are owned by this module and cannot be overridden by a
+    # caller-provided base mapping.
+    contract["schema_version"] = _CHECKPOINT_SCHEMA_VERSION
+    contract["artifact_kind"] = _CONTRACT_ARTIFACT
     contract["run_kind"] = run_kind
     contract["comparable"] = bool(run_kind == "experiment" if comparable is None else comparable)
     if run_kind == "smoke":
@@ -511,7 +758,9 @@ def preflight_startup_checkpoint(
     if mode == "cold_start":
         if path is not None:
             raise ValueError("cold_start cannot receive a checkpoint path")
-        return StartupCheckpointPreflight("cold_start", None, None, None, MappingProxyType({}))
+        return StartupCheckpointPreflight(
+            "cold_start", None, None, None, MappingProxyType({}), None
+        )
     if path is None:
         raise ValueError(f"{mode} requires a checkpoint path")
     checkpoint = Path(path)
@@ -542,6 +791,7 @@ def preflight_startup_checkpoint(
             digest,
             frozen,
             MappingProxyType(dict(report)),
+            raw,
         )
 
     payload_mapping = _as_mapping(payload, "resume checkpoint")
@@ -564,12 +814,12 @@ def preflight_startup_checkpoint(
         raise ValueError("resume checkpoint artifact_kind is not full private-training .ckpt")
     state = _as_mapping(payload_mapping["model_state_dict"], "model_state_dict")
     report = _schema_check(state, normalized_schema, allow_author_extras=False)
+    _validate_optimizer_state(payload_mapping["optimizer_state_dict"])
+    _validate_scheduler_state(payload_mapping["scheduler_state_dict"])
     progress = _validate_progress(payload_mapping["progress"])
     best = _validate_best(payload_mapping["best_metrics"])
-    rng = _as_mapping(payload_mapping["rng_state"], "rng_state")
-    if set(rng) != {"python", "numpy", "torch", "cuda"}:
-        raise ValueError("resume checkpoint rng_state is incomplete")
-    contract = _as_mapping(payload_mapping["run_contract"], "run_contract")
+    _validate_rng_state(payload_mapping["rng_state"])
+    contract = _validate_run_contract(payload_mapping["run_contract"])
     if expected_contract is not None:
         _contract_compatible(contract, expected_contract)
     report.update(
@@ -589,6 +839,7 @@ def preflight_startup_checkpoint(
         digest,
         frozen,
         MappingProxyType(dict(report)),
+        raw,
     )
 
 
@@ -653,7 +904,7 @@ def save_resume_checkpoint(
         raise ValueError("resume checkpoint must use the .ckpt suffix")
     progress = _validate_progress(asdict(progress))
     best = _validate_best(asdict(best))
-    contract = _as_mapping(contract, "run_contract")
+    contract = _validate_run_contract(contract)
     payload = {
         "schema_version": _CHECKPOINT_SCHEMA_VERSION,
         "artifact_kind": _CHECKPOINT_ARTIFACT,
@@ -665,6 +916,9 @@ def save_resume_checkpoint(
         "rng_state": _cpu_copy(capture_rng_state()),
         "run_contract": _json_safe(contract),
     }
+    _validate_optimizer_state(payload["optimizer_state_dict"])
+    _validate_scheduler_state(payload["scheduler_state_dict"])
+    _validate_rng_state(payload["rng_state"])
     _atomic_replace(checkpoint, _torch_bytes(payload), label="private-training checkpoint")
     return checkpoint
 
@@ -729,8 +983,11 @@ def load_initial_weights(
     )
     if preflight.payload is None:
         raise ValueError("initial checkpoint preflight has no payload")
-    frozen_mapping = _as_mapping(preflight.payload, "initial checkpoint preflight")
-    state = _as_mapping(frozen_mapping["state_dict"], "initial checkpoint state_dict")
+    fresh_mapping = _fresh_preflight_payload(preflight)
+    if "state_dict" in fresh_mapping:
+        state = _as_mapping(fresh_mapping["state_dict"], "initial checkpoint state_dict")
+    else:
+        state = fresh_mapping
     live_report = _schema_check(state, _model_schema(model), allow_author_extras=True)
     thawed = _thaw(state)
     result = model.load_state_dict(thawed, strict=False)  # type: ignore[arg-type]
@@ -761,7 +1018,7 @@ def load_resume_checkpoint(
     )
     if preflight.payload is None:
         raise ValueError("resume checkpoint preflight has no payload")
-    payload = _as_mapping(preflight.payload, "resume checkpoint preflight")
+    payload = _fresh_preflight_payload(preflight)
     live_schema = _model_schema(model)
     expected_fingerprint = preflight.load_report.get("expected_schema_sha256")
     if expected_fingerprint != schema_fingerprint(live_schema):
@@ -856,8 +1113,14 @@ def export_inference_weights(
     sidecar_raw = (json.dumps(sidecar_data, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
         "utf-8"
     )
-    _atomic_replace(weights_path, raw, label="raw LINO inference weights")
-    _atomic_replace(sidecar, sidecar_raw, label="raw LINO inference sidecar")
+    # Publish the two files through one staged bundle.  If either replacement
+    # fails, the bundle helper restores both previous files (or removes both
+    # newly-created files), so a raw weight can never appear without its
+    # provenance sidecar.
+    publish_epoch_artifacts(
+        weights_path.parent,
+        artifacts={weights_path.name: raw, sidecar.name: sidecar_raw},
+    )
     return ExportResult(weights_path, sidecar, digest)
 
 
@@ -994,8 +1257,17 @@ def publish_epoch_artifacts(
             replaced.append(name)
             staged[name] = ""
         os.fsync(directory_fd)
-        for backup in backups.values():
-            os.unlink(backup, dir_fd=directory_fd)
+        # The public bundle is committed after the replacement loop and
+        # directory fsync.  Backup cleanup is post-commit housekeeping: if a
+        # backup cannot be removed, retain it as a hidden rollback copy and do
+        # not enter the rollback path (which could no longer restore a backup
+        # that was already deleted).
+        for name, backup in list(backups.items()):
+            try:
+                os.unlink(backup, dir_fd=directory_fd)
+            except OSError:
+                continue
+            backups.pop(name, None)
         return {name: destination / name for name in merged}
     except Exception as exc:
         # Restore every public name, including names replaced before a later
@@ -1050,22 +1322,37 @@ def apply_artifact_retention(
     if any(epoch <= 0 for epoch in keep) or (latest_epoch is not None and latest_epoch <= 0):
         raise ValueError("retention epochs must be positive")
     removed: list[Path] = []
-    directories = [root]
-    for child in (root / "checkpoints", root / "exports"):
-        if child.is_dir() and not child.is_symlink():
-            directories.append(child)
+    directories = [root, root / "checkpoints", root / "exports"]
     for directory in directories:
-        for candidate in directory.iterdir():
-            if candidate.is_symlink() or not candidate.is_file():
-                continue
-            match = _EPOCH_NAME.search(candidate.stem)
-            if match is None:
-                continue
-            epoch = int(match.group(1))
-            if epoch in keep or (latest_epoch is not None and epoch == latest_epoch):
-                continue
-            candidate.unlink()
-            removed.append(candidate)
+        try:
+            descriptor, _identity, absolute = _open_existing_directory_path(
+                directory,
+                label="artifact retention directory",
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            for name in os.listdir(descriptor):
+                try:
+                    info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    continue
+                match = _EPOCH_NAME.search(Path(name).stem)
+                if match is None:
+                    continue
+                epoch = int(match.group(1))
+                if epoch in keep or (latest_epoch is not None and epoch == latest_epoch):
+                    continue
+                os.unlink(name, dir_fd=descriptor)
+                removed.append(absolute / name)
+            os.fsync(descriptor)
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     return tuple(sorted(removed))
 
 
