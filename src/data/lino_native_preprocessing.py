@@ -139,7 +139,6 @@ def prepare_lino_native_geometry(
     available to the model without becoming target support.
     """
 
-    del object_name  # Kept in the public contract for caller-side diagnostics.
     version = _validate_version(preprocessing_version)
     resolution = _validate_resolution(target_resolution, version=version)
     if isinstance(margin, bool) or not isinstance(margin, int) or margin < 0:
@@ -181,6 +180,15 @@ def prepare_lino_native_geometry(
             source_target_mask = np.asarray(
                 np.linalg.norm(source_target_normal.astype(np.float64), axis=2) > 0,
                 dtype=np.float32,
+            )
+
+    if source_target_mask is not None:
+        outside_support = (source_target_mask > 0) & (source_model_mask <= 0)
+        outside_count = int(np.count_nonzero(outside_support))
+        if outside_count:
+            raise ValueError(
+                f"{object_name}: target_mask has {outside_count} pixel(s) "
+                "outside model support"
             )
 
     roi = _validate_roi(

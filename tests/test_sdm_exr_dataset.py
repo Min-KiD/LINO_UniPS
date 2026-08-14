@@ -359,6 +359,40 @@ class SdmExrDatasetTests(unittest.TestCase):
         np.testing.assert_array_equal(sample["roi"].numpy(), roi)
         np.testing.assert_allclose(sample["metadata"]["normalization_alpha"], alpha)
         np.testing.assert_allclose(sample["metadata"]["normalization_scales"], scales)
+        expected_metadata = {
+            "object_name": record.name,
+            "object_relative_dir": record.relative_dir,
+            "selected_images": list(record.selected_images),
+            "selected_image_sha256": list(record.image_sha256),
+            "selected_image_digests": list(record.image_sha256),
+            "source_geometry": {"height": record.height, "width": record.width},
+            "roi": [int(value) for value in roi],
+            "resized_geometry": {"height": target, "width": target},
+            "mask_policy": config.mask_policy,
+            "mask_source": "binary_mask.exr",
+            "mask_digest": record.mask_sha256,
+            "normalization": {"alpha": alpha.tolist(), "scales": scales.tolist()},
+            "normalization_alpha": alpha.tolist(),
+            "normalization_scales": scales.tolist(),
+            "seed": config.seed,
+            "normalization_seed": legacy_manifest_seed(
+                config.seed,
+                record.name,
+                "lino_normalization",
+            ),
+        }
+        self.assertEqual(sample["metadata"], expected_metadata)
+
+    def test_private_version_metadata_exposes_preprocessing_version(self):
+        make_object(self.data_root, "alpha.data")
+        config, manifest = self.manifest(
+            preprocessing_version="private_external_lino_native_v1"
+        )
+        sample = SdmExrDataset(config, manifest)[0]
+        self.assertEqual(
+            sample["metadata"]["preprocessing_version"],
+            "private_external_lino_native_v1",
+        )
 
     def test_external_and_full_use_their_own_native_normalization_support(self):
         object_dir = make_object(self.data_root, "alpha.data")

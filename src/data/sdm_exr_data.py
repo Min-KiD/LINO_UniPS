@@ -25,6 +25,7 @@ from src.comparison.manifest import DatasetManifest, ObjectRecord
 from src.comparison.provenance import sha256_bytes
 from .data_module import get_roi
 from .lino_native_preprocessing import (
+    RELEASED_TRANSFER_VERSION,
     _normalization_seed,
     normalize_lino_observations,
     prepare_lino_native_geometry,
@@ -357,8 +358,9 @@ class SdmExrDataset(Dataset):
                     self.config.preprocessing_version,
                 )
             ),
-            "preprocessing_version": self.config.preprocessing_version,
         }
+        if self.config.preprocessing_version != RELEASED_TRANSFER_VERSION:
+            metadata["preprocessing_version"] = self.config.preprocessing_version
         sample: dict[str, Any] = {
             "imgs": torch.from_numpy(normalized.transpose(2, 0, 1, 3).copy()),
             "mask": torch.from_numpy(np.asarray(prepared["mask"][None], dtype=np.float32).copy()),
