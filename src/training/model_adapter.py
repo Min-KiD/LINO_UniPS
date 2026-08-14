@@ -7,6 +7,7 @@ for the encoder/decoder calls used by ``LiNo_UniPS.model_step``.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -24,6 +25,55 @@ _EXPECTED_SIDE = 512
 _SMOOTHING_SIGMA = 1
 _SMOOTHING_SCALE = 10
 _DECODE_CHUNK = 16
+
+
+def _model_device(model: torch.nn.Module) -> torch.device | None:
+    """Find the released model execution device without moving any state."""
+
+    declared_device = getattr(model, "device", None)
+    if declared_device is not None:
+        try:
+            return torch.device(declared_device)
+        except (TypeError, RuntimeError):
+            pass
+    for parameter in model.parameters():
+        return parameter.device
+    for buffer in model.buffers():
+        return buffer.device
+    return None
+
+
+def _is_released_lino(model: torch.nn.Module) -> bool:
+    model_class = type(model)
+    return model_class.__name__ == "LiNo_UniPS" or model_class.__module__.endswith("models.Net_module")
+
+
+def _has_bfloat16_boundary(model: torch.nn.Module) -> bool:
+    image_encoder = getattr(model, "image_encoder", None)
+    if image_encoder is None:
+        return False
+    return any(buffer.dtype == torch.bfloat16 for buffer in image_encoder.buffers())
+
+
+@contextmanager
+def _released_dtype_bridge(
+    model: torch.nn.Module,
+    input_device: torch.device,
+):
+    """Bridge float32 dataset tensors into the released CUDA BF16 boundary."""
+
+    model_device = _model_device(model) or input_device
+    if model_device.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            yield torch.bfloat16
+        return
+    if _is_released_lino(model) or _has_bfloat16_boundary(model):
+        raise RuntimeError(
+            "released LiNo_UniPS execution requires CUDA BF16 autocast; "
+            "CPU/fp32 execution is unsupported"
+        )
+    # Small CPU fake components intentionally remain in their native dtype.
+    yield None
 
 
 @dataclass(frozen=True)
@@ -138,7 +188,9 @@ def encode_private_batch(
         height,
         width,
     )
-    encoder_output = model.image_encoder(encoder_input, light_counts, int(canonical_resolution))
+    with _released_dtype_bridge(model, encoder_input.device) as bridge_dtype:
+        released_input = encoder_input if bridge_dtype is None else encoder_input.to(bridge_dtype)
+        encoder_output = model.image_encoder(released_input, light_counts, int(canonical_resolution))
     if not isinstance(encoder_output, (tuple, list)) or not encoder_output:
         raise TypeError("released image_encoder must return GLC features and auxiliary tokens")
     glc = _require_tensor(encoder_output[0], "image_encoder GLC output")
@@ -213,17 +265,18 @@ def _validate_index_chunks(
                 torch.uint8,
             ):
                 raise TypeError("trusted indices must use an integer dtype")
-            if indices.numel():
-                minimum = int(indices.min().item())
-                maximum = int(indices.max().item())
-                if minimum < 0 or maximum >= pixel_count:
-                    raise ValueError("trusted indices must be in range")
-                values = [int(value) for value in indices.detach().cpu().tolist()]
-                if len(set(values)) != len(values):
-                    raise ValueError("trusted indices must be unique within each object")
-                if seen.intersection(values):
-                    raise ValueError("trusted indices must not overlap across chunks")
-                seen.update(values)
+            if not indices.numel():
+                raise ValueError("trusted index chunks must be nonempty")
+            minimum = int(indices.min().item())
+            maximum = int(indices.max().item())
+            if minimum < 0 or maximum >= pixel_count:
+                raise ValueError("trusted indices must be in range")
+            values = [int(value) for value in indices.detach().cpu().tolist()]
+            if len(set(values)) != len(values):
+                raise ValueError("trusted indices must be unique within each object")
+            if seen.intersection(values):
+                raise ValueError("trusted indices must not overlap across chunks")
+            seen.update(values)
             chunks.append(indices)
         validated.append(tuple(chunks))
     return tuple(validated)
@@ -239,38 +292,44 @@ def _decode_one_chunk(
     observation_pixels = object_observations[device_indices]
     glc_pixels = object_glc[device_indices]
     if not indices.numel():
-        prediction = object_observations.new_empty((0, 3))
-        return DecodedNormalChunk(indices=device_indices, prediction=prediction)
+        raise ValueError("trusted index chunks must be nonempty")
     _require_finite(observation_pixels, "observation pixels")
     _require_finite(glc_pixels, "GLC pixels")
-    embedded = model.img_embedding(observation_pixels)
-    if not isinstance(embedded, torch.Tensor):
-        raise TypeError("img_embedding must return a tensor")
-    _require_finite(embedded, "embedded observation pixels")
-    features = embedded + glc_pixels
-    _require_finite(features, "embedded plus GLC features")
-    features = model.glc_upsample(features)
-    if not isinstance(features, torch.Tensor):
-        raise TypeError("glc_upsample must return a tensor")
-    _require_finite(features, "upsampled GLC features")
-    features = embedded + features
-    _require_finite(features, "residual GLC features")
-    features = model.glc_aggregation(features)
-    if not isinstance(features, torch.Tensor):
-        raise TypeError("glc_aggregation must return a tensor")
-    _require_finite(features, "aggregated GLC features")
-    regressor_output = model.regressor(features, len(device_indices))
-    if not isinstance(regressor_output, (tuple, list)) or not regressor_output:
-        raise TypeError("released regressor must return normal and auxiliary outputs")
-    raw_normal = _require_tensor(regressor_output[0], "regressor normal output")
-    _require_finite(raw_normal, "regressor normal output")
-    for auxiliary_number, auxiliary in enumerate(regressor_output[1:], start=1):
-        if isinstance(auxiliary, torch.Tensor):
-            _require_finite(auxiliary, f"regressor auxiliary output {auxiliary_number}")
-    prediction = F.normalize(raw_normal.reshape(-1, 3), p=2, dim=-1, eps=1.0e-6)
-    if prediction.shape != (indices.numel(), 3):
-        raise ValueError("regressor normal output does not match trusted index count")
-    _require_finite(prediction, "normal prediction")
+    with _released_dtype_bridge(model, object_observations.device) as bridge_dtype:
+        if bridge_dtype is None:
+            released_observations = observation_pixels
+            released_glc = glc_pixels
+        else:
+            released_observations = observation_pixels.to(bridge_dtype)
+            released_glc = glc_pixels.to(bridge_dtype)
+        embedded = model.img_embedding(released_observations)
+        if not isinstance(embedded, torch.Tensor):
+            raise TypeError("img_embedding must return a tensor")
+        _require_finite(embedded, "embedded observation pixels")
+        features = embedded + released_glc
+        _require_finite(features, "embedded plus GLC features")
+        features = model.glc_upsample(features)
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("glc_upsample must return a tensor")
+        _require_finite(features, "upsampled GLC features")
+        features = embedded + features
+        _require_finite(features, "residual GLC features")
+        features = model.glc_aggregation(features)
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("glc_aggregation must return a tensor")
+        _require_finite(features, "aggregated GLC features")
+        regressor_output = model.regressor(features, len(device_indices))
+        if not isinstance(regressor_output, (tuple, list)) or not regressor_output:
+            raise TypeError("released regressor must return normal and auxiliary outputs")
+        raw_normal = _require_tensor(regressor_output[0], "regressor normal output")
+        _require_finite(raw_normal, "regressor normal output")
+        for auxiliary_number, auxiliary in enumerate(regressor_output[1:], start=1):
+            if isinstance(auxiliary, torch.Tensor):
+                _require_finite(auxiliary, f"regressor auxiliary output {auxiliary_number}")
+        prediction = F.normalize(raw_normal.reshape(-1, 3), p=2, dim=-1, eps=1.0e-6)
+        if prediction.shape != (indices.numel(), 3):
+            raise ValueError("regressor normal output does not match trusted index count")
+        _require_finite(prediction, "normal prediction")
     return DecodedNormalChunk(indices=device_indices, prediction=prediction)
 
 
