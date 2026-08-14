@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
+from src.data import private_exr_train
+from src.training import private_manifest
 from src.training.config import PrivateTrainConfig
 from src.training.private_manifest import (
     PrivateSplitManifest,
@@ -18,6 +25,10 @@ from src.training.private_manifest import (
 from tests.comparison_helpers import write_mask_exr, write_rgb_exr
 
 from src.data.private_exr_train import EXPECTED_FIELDS, PrivateExrTrainDataset, collate_private_exr
+
+
+def _metadata_only_collate(samples):
+    return samples[0]["metadata"]
 
 
 class PrivateExrTrainDatasetTests(unittest.TestCase):
@@ -123,6 +134,32 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
         self.assertEqual(sample["imgs"].dtype, torch.float32)
         self.assertTrue(sample["imgs"].is_contiguous())
 
+        record = manifest.objects[0]
+        digest_by_name = dict(zip(record.observation_files, record.observation_sha256))
+        self.assertEqual(
+            sample["metadata"]["selected_image_sha256"],
+            [digest_by_name[name] for name in sample["metadata"]["selected_images"]],
+        )
+        self.assertEqual(sample["metadata"]["normal_sha256"], record.normal_sha256)
+        self.assertEqual(sample["metadata"]["mask_sha256"], record.mask_sha256)
+
+        expected_layout = {
+            "imgs": ((3, 512, 512, 6), torch.float32),
+            "model_mask": ((1, 512, 512), torch.float32),
+            "target_normal": ((3, 512, 512), torch.float32),
+            "target_mask": ((1, 512, 512), torch.float32),
+            "source_target_normal": ((3, 256, 256), torch.float32),
+            "source_target_mask": ((1, 256, 256), torch.float32),
+            "source_model_mask": ((1, 256, 256), torch.float32),
+            "roi": ((6,), torch.int64),
+        }
+        for name, (shape, dtype) in expected_layout.items():
+            with self.subTest(field=name):
+                self.assertIsInstance(sample[name], torch.Tensor)
+                self.assertEqual(tuple(sample[name].shape), shape)
+                self.assertEqual(sample[name].dtype, dtype)
+                self.assertTrue(sample[name].is_contiguous())
+
     def test_train_selection_and_normalization_vary_by_epoch(self):
         config, manifest = self.manifest()
         dataset = PrivateExrTrainDataset(config, manifest, split="train")
@@ -211,6 +248,53 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
         with self.assertRaises((RuntimeError, ValueError)):
             collate_private_exr([good, incompatible])
 
+    def test_collator_rejects_wrong_tensor_shapes_dtypes_contiguity_and_metadata(self):
+        good = {
+            "imgs": torch.zeros((3, 512, 512, 6), dtype=torch.float32),
+            "model_mask": torch.ones((1, 512, 512), dtype=torch.float32),
+            "target_normal": torch.zeros((3, 512, 512), dtype=torch.float32),
+            "target_mask": torch.ones((1, 512, 512), dtype=torch.float32),
+            "source_target_normal": torch.zeros((3, 256, 256), dtype=torch.float32),
+            "source_target_mask": torch.ones((1, 256, 256), dtype=torch.float32),
+            "source_model_mask": torch.ones((1, 256, 256), dtype=torch.float32),
+            "roi": torch.zeros((6,), dtype=torch.int64),
+            "metadata": {"object_name": "a.data"},
+        }
+        wrong_shapes = {
+            "imgs": (3, 512, 512, 5),
+            "model_mask": (1, 256, 256),
+            "target_normal": (3, 256, 256),
+            "target_mask": (1, 256, 256),
+            "source_target_normal": (3, 512, 512),
+            "source_target_mask": (1, 512, 512),
+            "source_model_mask": (1, 512, 512),
+            "roi": (5,),
+        }
+        for field, shape in wrong_shapes.items():
+            with self.subTest(kind="shape", field=field):
+                bad = dict(good)
+                bad[field] = torch.zeros(shape, dtype=good[field].dtype)
+                with self.assertRaisesRegex(ValueError, field):
+                    collate_private_exr([bad])
+
+        for field in ("imgs", "model_mask", "target_normal", "target_mask", "source_target_normal", "source_target_mask", "source_model_mask"):
+            with self.subTest(kind="dtype", field=field):
+                bad = dict(good)
+                bad[field] = bad[field].to(torch.float64)
+                with self.assertRaisesRegex(ValueError, field):
+                    collate_private_exr([bad])
+        with self.assertRaisesRegex(ValueError, "roi"):
+            bad = dict(good, roi=good["roi"].to(torch.int32))
+            collate_private_exr([bad])
+
+        noncontiguous = dict(good)
+        noncontiguous["imgs"] = torch.zeros((3, 512, 512, 12), dtype=torch.float32)[..., ::2]
+        self.assertFalse(noncontiguous["imgs"].is_contiguous())
+        with self.assertRaisesRegex(ValueError, "imgs.*contiguous"):
+            collate_private_exr([noncontiguous])
+        with self.assertRaisesRegex(ValueError, "metadata"):
+            collate_private_exr([dict(good, metadata=[])])
+
     def test_set_epoch_rejects_bool_negative_and_non_integer_values(self):
         config, manifest = self.manifest()
         dataset = PrivateExrTrainDataset(config, manifest, split="train")
@@ -243,6 +327,181 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
         write_mask_exr(self.train_root / record.name / record.mask_file, changed)
         with self.assertRaisesRegex(ValueError, "digest"):
             PrivateExrTrainDataset(config, manifest, split="train")[0]
+
+    def test_mid_read_swap_preserves_observation_gt_and_mask_byte_snapshots(self):
+        config, manifest = self.manifest()
+        dataset = PrivateExrTrainDataset(config, manifest, split="train")
+        record = manifest.objects[0]
+        selected_name = dataset._selected_names(record)[0]
+        source_paths = {
+            "observation": self.train_root / record.name / selected_name,
+            "ground truth": self.train_root / record.name / record.normal_file,
+            "external mask": self.train_root / record.name / record.mask_file,
+        }
+        replacements = {
+            "observation": np.full((256, 256, 3), 99.0, dtype=np.float32),
+            "ground truth": np.full((256, 256, 3), 0.5, dtype=np.float32),
+            "external mask": np.ones((256, 256), dtype=np.float32),
+        }
+        for role, path in source_paths.items():
+            with self.subTest(role=role):
+                original = path.read_bytes()
+                if role == "external mask":
+                    from tests.comparison_helpers import write_mask_exr
+
+                    write_mask_exr(path, replacements[role])
+                else:
+                    from tests.comparison_helpers import write_rgb_exr
+
+                    write_rgb_exr(path, replacements[role])
+                changed = path.read_bytes()
+                path.write_bytes(original)
+                original_read = private_manifest.PrivateSourceSnapshot.read
+                captured_digest: str | None = None
+
+                def swap_after_read(reader, filename, role):
+                    payload, digest = original_read(reader, filename=filename, role=role)
+                    if filename == path.name:
+                        path.write_bytes(changed)
+                    return payload, digest
+
+                original_rgb_decoder = private_exr_train.read_rgb_exr_bytes
+                original_mask_decoder = private_exr_train.read_mask_exr_bytes
+
+                def capture_rgb(payload, *, label):
+                    nonlocal captured_digest
+                    if path.name in label:
+                        captured_digest = hashlib.sha256(payload).hexdigest()
+                    return original_rgb_decoder(payload, label=label)
+
+                def capture_mask(payload, *, label):
+                    nonlocal captured_digest
+                    if path.name in label:
+                        captured_digest = hashlib.sha256(payload).hexdigest()
+                    return original_mask_decoder(payload, label=label)
+
+                with (
+                    mock.patch.object(
+                        private_manifest.PrivateSourceSnapshot,
+                        "read",
+                        autospec=True,
+                        side_effect=swap_after_read,
+                    ),
+                    mock.patch.object(
+                        private_exr_train,
+                        "read_rgb_exr_bytes",
+                        side_effect=capture_rgb,
+                    ),
+                    mock.patch.object(
+                        private_exr_train,
+                        "read_mask_exr_bytes",
+                        side_effect=capture_mask,
+                    ),
+                ):
+                    sample = dataset[0]
+                path.write_bytes(original)
+                expected = (
+                    record.observation_sha256[record.observation_files.index(selected_name)]
+                    if role == "observation"
+                    else record.normal_sha256
+                    if role == "ground truth"
+                    else record.mask_sha256
+                )
+                if role == "external mask":
+                    self.assertEqual(sample["metadata"]["mask_sha256"], expected)
+                else:
+                    self.assertEqual(captured_digest, expected)
+                if role == "external mask":
+                    self.assertEqual(captured_digest, expected)
+
+    def test_source_symlink_is_rejected_after_manifest(self):
+        config, manifest = self.manifest()
+        record = manifest.objects[0]
+        source = self.train_root / record.name / record.observation_files[0]
+        outside = self.root / "outside.exr"
+        outside.write_bytes(source.read_bytes())
+        original = source.read_bytes()
+        source.unlink()
+        os.symlink(outside, source)
+        try:
+            with self.assertRaisesRegex(ValueError, "symlink|regular|secure"):
+                PrivateExrTrainDataset(config, manifest, split="train")[0]
+        finally:
+            source.unlink()
+            source.write_bytes(original)
+
+    def test_object_and_root_symlink_swaps_fail_closed(self):
+        config, manifest = self.manifest()
+        record = manifest.objects[0]
+
+        object_dir = self.train_root / record.name
+        object_real = self.root / "alpha-real.data"
+        object_dir.rename(object_real)
+        os.symlink(object_real, object_dir, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink|directory|root"):
+            PrivateExrTrainDataset(config, manifest, split="train")[0]
+        object_dir.unlink()
+        object_real.rename(object_dir)
+
+        root_real = self.root / "train-real"
+        self.train_root.rename(root_real)
+        os.symlink(root_real, self.train_root, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink|directory|root"):
+            PrivateExrTrainDataset(config, manifest, split="train")[0]
+        self.train_root.unlink()
+        root_real.rename(self.train_root)
+
+    def test_parent_symlink_swap_fails_closed(self):
+        nested_parent = self.root / "nested-parent"
+        nested_train = nested_parent / "train"
+        nested_parent.mkdir()
+        nested_train.mkdir()
+        test_root = self.root / "nested-test"
+        test_root.mkdir()
+        config = self.config(train_dir=nested_train, test_dir=test_root)
+        self._write_object(nested_train, "alpha.data")
+        manifest = build_private_split_manifest(config, "train")
+
+        replacement_parent = self.root / "replacement-parent"
+        shutil.copytree(nested_parent, replacement_parent)
+        nested_parent_real = self.root / "nested-parent-real"
+        nested_parent.rename(nested_parent_real)
+        os.symlink(replacement_parent, nested_parent, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(ValueError, "symlink|directory|root"):
+                PrivateExrTrainDataset(config, manifest, split="train")[0]
+        finally:
+            nested_parent.unlink()
+            nested_parent_real.rename(nested_parent)
+
+    def test_persistent_workers_observe_epoch_updates(self):
+        config, manifest = self.manifest()
+        dataset = PrivateExrTrainDataset(config, manifest, split="train")
+        loader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            persistent_workers=True,
+            prefetch_factor=1,
+            collate_fn=_metadata_only_collate,
+        )
+        try:
+            dataset.set_epoch(0)
+            first = next(iter(loader))
+            dataset.set_epoch(1)
+            second = next(iter(loader))
+            self.assertEqual(first["epoch"], 0)
+            self.assertEqual(second["epoch"], 1)
+            self.assertNotEqual(
+                first["selected_images"],
+                second["selected_images"],
+            )
+        finally:
+            iterator = getattr(loader, "_iterator", None)
+            if iterator is not None:
+                iterator._shutdown_workers()
+            del loader
 
     def test_source_and_target_masks_remain_separate(self):
         config, manifest = self.manifest()

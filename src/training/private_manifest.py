@@ -372,6 +372,154 @@ def _snapshot(
         raise _contextualize(split, object_name, filename, exc) from exc
 
 
+class PrivateSourceSnapshot:
+    """Read one manifest object's sources through pinned descriptors.
+
+    The root and object descriptors remain open for the lifetime of the
+    snapshot.  Every source read is descriptor-relative and revalidates both
+    directory identities before and after consuming the immutable bytes.
+    """
+
+    def __init__(
+        self,
+        config: PrivateTrainConfig,
+        split: str,
+        record: PrivateObjectRecord,
+    ) -> None:
+        if not isinstance(config, PrivateTrainConfig):
+            raise TypeError("config must be a PrivateTrainConfig")
+        if split not in {"train", "test"}:
+            raise ValueError("split must be one of: train, test")
+        if not isinstance(record, PrivateObjectRecord):
+            raise TypeError("record must be a PrivateObjectRecord")
+        if not _safe_basename(record.name) or record.relative_dir != record.name:
+            raise ValueError(f"manifest relative_dir is unsafe for {record.name}")
+
+        self.config = config
+        self.split = split
+        self.record = record
+        self._root_fd: int | None = None
+        self._object_fd: int | None = None
+        split_name, root, _, expected_root = _split_root(config, split)
+        root_fd, root_identity = _open_root(root, expected_root, split=split_name)
+        object_fd: int | None = None
+        try:
+            try:
+                info = os.stat(record.name, dir_fd=root_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise _contextualize(split, record.name, "<object-directory>", exc) from exc
+            expected_object = (int(info.st_dev), int(info.st_ino))
+            object_fd, object_identity, object_path = _open_object(
+                root_fd,
+                root_identity,
+                record.name,
+                root,
+                split=split_name,
+            )
+            if object_identity != expected_object:
+                _raise_failure(split, record.name, "<object-directory>", "object directory identity changed")
+        except Exception:
+            if object_fd is not None:
+                try:
+                    os.close(object_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+            raise
+        self._root_fd = root_fd
+        self._root_identity = root_identity
+        self._root_path = root
+        self._object_fd = object_fd
+        self._object_identity = object_identity
+        self._object_path = object_path
+        self._closed = False
+
+    def __enter__(self) -> "PrivateSourceSnapshot":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for descriptor in (self._object_fd, self._root_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        self._object_fd = None
+        self._root_fd = None
+
+    def read(self, filename: str, *, role: str) -> tuple[bytes, str]:
+        if self._closed or self._root_fd is None or self._object_fd is None:
+            raise ValueError("private source snapshot is closed")
+        if not isinstance(role, str) or not role:
+            raise ValueError("private source snapshot role must be a non-empty string")
+        _assert_root_fd(
+            self._root_fd,
+            self._root_identity,
+            split=self.split,
+            object_name=self.record.name,
+            filename=filename,
+        )
+        try:
+            assert_directory_path_identity(
+                self._root_path,
+                {"dev": self._root_identity[0], "ino": self._root_identity[1]},
+                label=f"{self.split} data root",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _contextualize(self.split, self.record.name, filename, exc) from exc
+        source_name, source_identity = _required_source(
+            self._object_fd,
+            filename,
+            split=self.split,
+            object_name=self.record.name,
+            role=role,
+        )
+        payload, digest = _snapshot(
+            self._object_fd,
+            source_name,
+            source_identity,
+            self._object_identity,
+            self._object_path,
+            split=self.split,
+            object_name=self.record.name,
+        )
+        _assert_root_fd(
+            self._root_fd,
+            self._root_identity,
+            split=self.split,
+            object_name=self.record.name,
+            filename=filename,
+        )
+        try:
+            assert_directory_path_identity(
+                self._root_path,
+                {"dev": self._root_identity[0], "ino": self._root_identity[1]},
+                label=f"{self.split} data root",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _contextualize(self.split, self.record.name, filename, exc) from exc
+        return payload, digest
+
+
+def open_private_source_snapshot(
+    config: PrivateTrainConfig,
+    split: str,
+    record: PrivateObjectRecord,
+) -> PrivateSourceSnapshot:
+    """Open a descriptor-pinned source snapshot for one manifest record."""
+
+    return PrivateSourceSnapshot(config, split, record)
+
+
 def _decoded_rgb(
     payload: bytes,
     *,
@@ -718,9 +866,11 @@ def private_manifest_sha256(manifest: PrivateSplitManifest) -> str:
 
 
 __all__ = [
+    "PrivateSourceSnapshot",
     "PrivateObjectRecord",
     "PrivateSplitManifest",
     "build_private_split_manifest",
+    "open_private_source_snapshot",
     "private_manifest_bytes",
     "private_manifest_sha256",
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from multiprocessing import Value
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -10,20 +11,19 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.comparison.exr_io import (
-    read_file_bytes,
-    read_mask_exr_bytes,
-    read_rgb_exr_bytes,
-)
+from src.comparison.exr_io import read_mask_exr_bytes, read_rgb_exr_bytes
 from src.comparison.metrics import normal_validity_mask
 from src.comparison.normal_contract import decode_ground_truth_normal
-from src.comparison.provenance import sha256_bytes
 from src.data.lino_native_preprocessing import (
     normalize_lino_observations,
     prepare_lino_native_geometry,
 )
 from src.training.config import PrivateTrainConfig
-from src.training.private_manifest import PrivateObjectRecord, PrivateSplitManifest
+from src.training.private_manifest import (
+    PrivateObjectRecord,
+    PrivateSplitManifest,
+    open_private_source_snapshot,
+)
 from src.training.reproducibility import select_observation_names
 
 
@@ -50,6 +50,16 @@ _TENSOR_FIELDS = (
     "source_model_mask",
     "roi",
 )
+_FIELD_CONTRACT: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
+    "imgs": ((3, 512, 512, 6), torch.float32),
+    "model_mask": ((1, 512, 512), torch.float32),
+    "target_normal": ((3, 512, 512), torch.float32),
+    "target_mask": ((1, 512, 512), torch.float32),
+    "source_target_normal": ((3, 256, 256), torch.float32),
+    "source_target_mask": ((1, 256, 256), torch.float32),
+    "source_model_mask": ((1, 256, 256), torch.float32),
+    "roi": ((6,), torch.int64),
+}
 
 
 def _safe_basename(value: Any) -> bool:
@@ -67,18 +77,6 @@ def _safe_basename(value: Any) -> bool:
         and not windows_path.is_absolute()
         and not windows_path.drive
     )
-
-
-def _resolve_within(path: Path, root: Path, *, label: str) -> Path:
-    """Resolve a path and reject traversal or a symlink escape."""
-
-    resolved_root = root.resolve(strict=False)
-    resolved_path = path.resolve(strict=False)
-    try:
-        resolved_path.relative_to(resolved_root)
-    except ValueError as exc:
-        raise ValueError(f"{label} escapes resolved root/object: {path}") from exc
-    return resolved_path
 
 
 def _finite_source_shape(record: PrivateObjectRecord, config: PrivateTrainConfig) -> tuple[int, int]:
@@ -130,34 +128,11 @@ class PrivateExrTrainDataset(Dataset):
         self.config = config
         self.manifest = manifest
         self.split = split
-        self.epoch = 0
+        self._epoch_state = Value("q", 0, lock=True)
         self._data_root = config_root
         self.records = manifest.objects
         for record in self.records:
             self._validate_record(record)
-
-    @staticmethod
-    def _read_verified_snapshot(
-        path: Path,
-        expected: str,
-        *,
-        label: str,
-    ) -> tuple[bytes, str]:
-        """Read, hash, and retain one immutable source-file snapshot."""
-
-        try:
-            raw = read_file_bytes(path, label=label)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise ValueError(f"failed to read {label}: {path}") from exc
-        if not isinstance(raw, (bytes, bytearray, memoryview)):
-            raise ValueError(f"{label} reader did not return immutable bytes: {path}")
-        immutable = bytes(raw)
-        actual = sha256_bytes(immutable)
-        if actual != expected:
-            raise ValueError(
-                f"{label} digest mismatch for {path}: expected {expected}, got {actual}"
-            )
-        return immutable, actual
 
     def _validate_record(self, record: PrivateObjectRecord) -> None:
         if not isinstance(record, PrivateObjectRecord):
@@ -206,21 +181,16 @@ class PrivateExrTrainDataset(Dataset):
         if not _safe_basename(record.name) or record.relative_dir != record.name:
             raise ValueError(f"manifest relative_dir is unsafe for {record.name}")
         candidate = self._data_root / record.relative_dir
-        resolved = _resolve_within(candidate, self._data_root, label=f"manifest object {record.name}")
         if candidate.is_symlink():
             raise ValueError(f"manifest object must be a regular non-symlink directory: {candidate}")
-        if not resolved.is_dir():
+        if not candidate.is_dir():
             raise ValueError(f"manifest object directory is missing for {record.name}: {candidate}")
-        return resolved
+        return candidate
 
-    def _resolve_source_path(self, object_dir: Path, name: str, *, label: str) -> Path:
-        if not _safe_basename(name):
-            raise ValueError(f"manifest {label} is unsafe: {name!r}")
-        candidate = object_dir / name
-        resolved = _resolve_within(candidate, object_dir, label=f"manifest {label}")
-        if candidate.is_symlink():
-            raise ValueError(f"manifest {label} must be a regular non-symlink file: {candidate}")
-        return resolved
+    @property
+    def epoch(self) -> int:
+        with self._epoch_state.get_lock():
+            return int(self._epoch_state.value)
 
     def _selected_names(self, record: PrivateObjectRecord) -> tuple[str, ...]:
         return select_observation_names(
@@ -238,92 +208,91 @@ class PrivateExrTrainDataset(Dataset):
     def set_epoch(self, epoch: int) -> None:
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError("epoch must be a non-negative integer")
-        self.epoch = epoch
+        with self._epoch_state.get_lock():
+            self._epoch_state.value = epoch
 
     def __len__(self) -> int:
         return len(self.records)
 
     def _load_verified_sources(self, record: PrivateObjectRecord) -> dict[str, Any]:
-        object_dir = self._resolve_object_dir(record)
+        self._resolve_object_dir(record)
         source_shape = _finite_source_shape(record, self.config)
         digest_by_name = dict(zip(record.observation_files, record.observation_sha256))
         selected_names = self._selected_names(record)
 
         images: list[np.ndarray] = []
         selected_digests: list[str] = []
-        for filename in selected_names:
-            image_path = self._resolve_source_path(object_dir, filename, label="selected observation")
-            image_raw, image_digest = self._read_verified_snapshot(
-                image_path,
-                digest_by_name[filename],
-                label=f"selected observation {filename} for {record.name} in {self.split}",
-            )
+        with open_private_source_snapshot(self.config, self.split, record) as source:
+            for filename in selected_names:
+                image_raw, image_digest = source.read(filename=filename, role="selected observation")
+                if image_digest != digest_by_name[filename]:
+                    raise ValueError(
+                        f"selected observation {filename} digest mismatch for {record.name} in {self.split}"
+                    )
+                try:
+                    image = read_rgb_exr_bytes(
+                        image_raw,
+                        label=f"selected observation {filename} for {record.name} in {self.split}",
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ValueError(
+                        f"failed to decode selected observation {filename} for {record.name} in {self.split}"
+                    ) from exc
+                if image.shape[:2] != source_shape:
+                    raise ValueError(
+                        f"selected observation {filename} geometry mismatch for {record.name}: "
+                        f"{image.shape[:2]}, expected {source_shape}"
+                    )
+                images.append(np.ascontiguousarray(image, dtype=np.float32))
+                selected_digests.append(image_digest)
+
+            normal_raw, normal_digest = source.read(filename=record.normal_file, role="ground truth")
+            if normal_digest != record.normal_sha256:
+                raise ValueError(
+                    f"ground truth {record.normal_file} digest mismatch for {record.name} in {self.split}"
+                )
             try:
-                image = read_rgb_exr_bytes(
-                    image_raw,
-                    label=f"selected observation {filename} for {record.name} in {self.split}",
+                encoded_normal = read_rgb_exr_bytes(
+                    normal_raw,
+                    label=f"ground truth {record.normal_file} for {record.name} in {self.split}",
+                )
+                if encoded_normal.shape[:2] != source_shape:
+                    raise ValueError(
+                        f"ground truth {record.normal_file} geometry mismatch for {record.name}: "
+                        f"{encoded_normal.shape[:2]}, expected {source_shape}"
+                    )
+                target_normal = decode_ground_truth_normal(
+                    encoded_normal,
+                    self.config.normal_encoding,
+                    label=f"ground truth {record.normal_file} for {record.name} in {self.split}",
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                if "geometry mismatch" in str(exc):
+                    raise
+                raise ValueError(
+                    f"failed to decode ground truth {record.normal_file} for {record.name} in {self.split}"
+                ) from exc
+            target_mask = np.asarray(normal_validity_mask(target_normal), dtype=np.float32)
+
+            mask_raw, mask_digest = source.read(filename=record.mask_file, role="external mask")
+            if mask_digest != record.mask_sha256:
+                raise ValueError(
+                    f"external mask {record.mask_file} digest mismatch for {record.name} in {self.split}"
+                )
+            try:
+                model_mask = read_mask_exr_bytes(
+                    mask_raw,
+                    label=f"external mask {record.mask_file} for {record.name} in {self.split}",
                 )
             except (OSError, RuntimeError, ValueError) as exc:
                 raise ValueError(
-                    f"failed to decode selected observation {filename} for {record.name} in {self.split}"
+                    f"failed to decode external mask {record.mask_file} for {record.name} in {self.split}"
                 ) from exc
-            if image.shape[:2] != source_shape:
+            if model_mask.shape != source_shape:
                 raise ValueError(
-                    f"selected observation {filename} geometry mismatch for {record.name}: "
-                    f"{image.shape[:2]}, expected {source_shape}"
+                    f"external mask {record.mask_file} geometry mismatch for {record.name}: "
+                    f"{model_mask.shape}, expected {source_shape}"
                 )
-            images.append(np.ascontiguousarray(image, dtype=np.float32))
-            selected_digests.append(image_digest)
-
-        normal_path = self._resolve_source_path(object_dir, record.normal_file, label="ground truth")
-        normal_raw, normal_digest = self._read_verified_snapshot(
-            normal_path,
-            record.normal_sha256,
-            label=f"ground truth {record.normal_file} for {record.name} in {self.split}",
-        )
-        try:
-            encoded_normal = read_rgb_exr_bytes(
-                normal_raw,
-                label=f"ground truth {record.normal_file} for {record.name} in {self.split}",
-            )
-            if encoded_normal.shape[:2] != source_shape:
-                raise ValueError(
-                    f"ground truth {record.normal_file} geometry mismatch for {record.name}: "
-                    f"{encoded_normal.shape[:2]}, expected {source_shape}"
-                )
-            target_normal = decode_ground_truth_normal(
-                encoded_normal,
-                self.config.normal_encoding,
-                label=f"ground truth {record.normal_file} for {record.name} in {self.split}",
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            if "geometry mismatch" in str(exc):
-                raise
-            raise ValueError(
-                f"failed to decode ground truth {record.normal_file} for {record.name} in {self.split}"
-            ) from exc
-        target_mask = np.asarray(normal_validity_mask(target_normal), dtype=np.float32)
-
-        mask_path = self._resolve_source_path(object_dir, record.mask_file, label="external mask")
-        mask_raw, mask_digest = self._read_verified_snapshot(
-            mask_path,
-            record.mask_sha256,
-            label=f"external mask {record.mask_file} for {record.name} in {self.split}",
-        )
-        try:
-            model_mask = read_mask_exr_bytes(
-                mask_raw,
-                label=f"external mask {record.mask_file} for {record.name} in {self.split}",
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise ValueError(
-                f"failed to decode external mask {record.mask_file} for {record.name} in {self.split}"
-            ) from exc
-        if model_mask.shape != source_shape:
-            raise ValueError(
-                f"external mask {record.mask_file} geometry mismatch for {record.name}: "
-                f"{model_mask.shape}, expected {source_shape}"
-            )
 
         return {
             "images": np.ascontiguousarray(np.stack(images, axis=-1), dtype=np.float32),
@@ -469,6 +438,31 @@ def collate_private_exr(samples: list[dict[str, Any]]) -> dict[str, Any]:
         raise ValueError("private EXR batch must be nonempty")
     if any(not isinstance(sample, Mapping) or set(sample) != EXPECTED_FIELDS for sample in samples):
         raise ValueError("private EXR sample fields do not match the training contract")
+    reference_devices: dict[str, torch.device] = {}
+    for sample_index, sample in enumerate(samples):
+        if not isinstance(sample["metadata"], Mapping):
+            raise ValueError(f"metadata must be a mapping in private EXR sample {sample_index}")
+        for field in _TENSOR_FIELDS:
+            value = sample[field]
+            expected_shape, expected_dtype = _FIELD_CONTRACT[field]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"{field} must be a Tensor in private EXR sample {sample_index}")
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    f"{field} has shape {tuple(value.shape)}; expected {expected_shape}"
+                )
+            if value.dtype != expected_dtype:
+                raise ValueError(
+                    f"{field} has dtype {value.dtype}; expected {expected_dtype}"
+                )
+            if not value.is_contiguous():
+                raise ValueError(f"{field} must be contiguous in private EXR sample {sample_index}")
+            if field not in reference_devices:
+                reference_devices[field] = value.device
+            elif value.device != reference_devices[field]:
+                raise ValueError(f"{field} tensors must share one device across the batch")
+    if len(set(reference_devices.values())) != 1:
+        raise ValueError("private EXR tensors must share one device")
     batch: dict[str, Any] = {
         name: torch.stack([sample[name] for sample in samples], dim=0)
         for name in _TENSOR_FIELDS
