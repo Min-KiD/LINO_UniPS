@@ -104,6 +104,20 @@ class PrivateTrainingObjectiveTests(unittest.TestCase):
                 **common,
             )
 
+    def test_validation_epoch_is_still_type_checked(self):
+        mask = torch.ones(1, 2, 2)
+        common = {
+            "pixel_samples": 1,
+            "pixel_budget": 1,
+            "base_seed": 7,
+            "split": "test",
+            "object_name": "alpha.data",
+        }
+        with self.assertRaises(TypeError):
+            plan_target_chunks(mask, epoch=True, **common)
+        with self.assertRaises(ValueError):
+            plan_target_chunks(mask, epoch=-1, **common)
+
     def test_component_sse_is_object_balanced_and_uses_exact_indices(self):
         predictions = (
             (_chunk([0], [[1.0, 0.0, 0.0]]),),
@@ -144,6 +158,28 @@ class PrivateTrainingObjectiveTests(unittest.TestCase):
         bad_target[0, 0, 0, 0] = float("inf")
         with self.assertRaises(ValueError):
             component_sse_batch(((_chunk([0], [[0.0, 0.0, 0.0]]),),), bad_target)
+        duplicate = (
+            (_chunk([0], [[0.0, 0.0, 0.0]]), _chunk([0], [[0.0, 0.0, 0.0]])),
+        )
+        with self.assertRaises(ValueError):
+            component_sse_batch(duplicate, targets)
+        wrong_dtype = DecodedNormalChunk(
+            indices=torch.tensor([0], dtype=torch.float32),
+            prediction=torch.zeros(1, 3),
+        )
+        with self.assertRaises(TypeError):
+            component_sse_batch(((wrong_dtype,),), targets)
+
+    def test_component_sse_uses_exact_prediction_magnitude_and_backpropagates(self):
+        model = nn.Module()
+        model.vector = nn.Parameter(torch.tensor([[2.0, 0.0, 0.0]]))
+        predictions = ((DecodedNormalChunk(torch.tensor([0]), model.vector),),)
+        targets = torch.zeros(1, 3, 1, 1)
+        loss = component_sse_batch(predictions, targets)
+        self.assertTrue(torch.allclose(loss, torch.tensor(4.0)))
+        loss.backward()
+        self.assertTrue(torch.allclose(model.vector.grad, torch.tensor([[4.0, 0.0, 0.0]])))
+        finite_gradients_or_raise(model)
 
     def test_sampled_angular_mae_is_normalized_finite_and_in_degrees(self):
         targets = torch.zeros(2, 3, 1, 1)

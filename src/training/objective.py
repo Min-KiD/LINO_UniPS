@@ -40,7 +40,8 @@ def _effective_epoch(split: Any, epoch: Any) -> tuple[str, int]:
     if not isinstance(split, str) or not split.strip():
         raise TypeError("split must be a non-empty string")
     split_name = split.lower()
-    return split_name, _validate_epoch(epoch) if split_name == "train" else 0
+    validated_epoch = _validate_epoch(epoch)
+    return split_name, validated_epoch if split_name == "train" else 0
 
 
 def _single_object_target_mask(mask: torch.Tensor, object_name: str) -> torch.Tensor:
@@ -222,12 +223,11 @@ def component_sse_batch(
         errors: list[torch.Tensor] = []
         for chunk in object_chunks:
             indices = chunk.indices.to(device=targets.device, dtype=torch.long)
-            prediction = chunk.prediction.to(dtype=torch.float32)
-            # The adapter emits normalized normals.  Normalize again at this
-            # objective boundary so the loss remains correct for test doubles
-            # and future decoders while preserving the prediction gradient.
-            prediction = torch.nn.functional.normalize(prediction, p=2, dim=-1, eps=1.0e-6)
-            target_values = target[indices].to(dtype=prediction.dtype)
+            # The released adapter already returns normalized normals.  Keep
+            # those exact values here: this objective is the component-SSE
+            # contract, not another normalization/clamping boundary.
+            prediction = chunk.prediction
+            target_values = target[indices]
             error = (prediction - target_values).square().sum(dim=-1)
             if not torch.isfinite(error).all().item():
                 raise ValueError("component squared error is non-finite")
