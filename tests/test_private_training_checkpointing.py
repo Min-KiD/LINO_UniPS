@@ -166,12 +166,18 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
         sidecar = weights.with_suffix(".json")
         weights.write_bytes(b"old-weights")
         sidecar.write_bytes(b"old-sidecar")
-        original_publish = __import__("src.training.checkpointing", fromlist=["publish_epoch_artifacts"]).publish_epoch_artifacts
-        with mock.patch(
-            "src.training.checkpointing.publish_epoch_artifacts",
-            side_effect=OSError("sidecar publication failure"),
-        ):
-            with self.assertRaisesRegex(OSError, "sidecar publication"):
+        checkpointing = __import__("src.training.checkpointing", fromlist=["os"])
+        original_replace = checkpointing.os.replace
+        calls = {"count": 0}
+
+        def fail_second_replace(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("sidecar publication failure")
+            return original_replace(*args, **kwargs)
+
+        with mock.patch("src.training.checkpointing.os.replace", side_effect=fail_second_replace):
+            with self.assertRaisesRegex(ValueError, "publish|artifact"):
                 export_inference_weights(
                     weights,
                     model=self.model,
@@ -180,7 +186,6 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
                 )
         self.assertEqual(weights.read_bytes(), b"old-weights")
         self.assertEqual(sidecar.read_bytes(), b"old-sidecar")
-        self.assertIsNotNone(original_publish)
 
     def test_initialization_allows_only_the_four_author_extras(self) -> None:
         state = {name: tensor.detach().clone() for name, tensor in self.model.state_dict().items()}
@@ -297,6 +302,83 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
                         expected_contract=self.contract,
                     )
 
+    def test_preflight_rejects_semantically_invalid_rng_states(self) -> None:
+        checkpoint = self.root / "rng.ckpt"
+        save_resume_checkpoint(
+            checkpoint,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            progress=TrainingProgress(0, 1, 0),
+            best=BestMetrics(float("inf"), float("inf"), 0),
+            contract=self.contract,
+        )
+        valid = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        invalid_states = (
+            {**valid["rng_state"], "python": (999, tuple(range(625)), None)},
+            {**valid["rng_state"], "numpy": ("MT19937", np.zeros(1, dtype=np.uint32), 0, 0, 0.0)},
+            {**valid["rng_state"], "torch": torch.zeros(1, dtype=torch.uint8)},
+            {**valid["rng_state"], "cuda": [torch.zeros(1, dtype=torch.uint8)]},
+        )
+        for index, rng_state in enumerate(invalid_states):
+            with self.subTest(index=index):
+                candidate = copy.deepcopy(valid)
+                candidate["rng_state"] = rng_state
+                torch.save(candidate, checkpoint)
+                with self.assertRaisesRegex(ValueError, "rng"):
+                    preflight_startup_checkpoint(
+                        "resume",
+                        checkpoint,
+                        expected_schema=self.model,
+                        expected_contract=self.contract,
+                    )
+
+    def test_preflight_rejects_empty_partial_and_unknown_scheduler_state(self) -> None:
+        checkpoint = self.root / "scheduler.ckpt"
+        save_resume_checkpoint(
+            checkpoint,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            progress=TrainingProgress(0, 1, 0),
+            best=BestMetrics(float("inf"), float("inf"), 0),
+            contract=self.contract,
+        )
+        valid = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        invalid_states = ({}, {"last_epoch": 1}, {"unknown": 1})
+        for index, scheduler_state in enumerate(invalid_states):
+            with self.subTest(index=index):
+                candidate = copy.deepcopy(valid)
+                candidate["scheduler_state_dict"] = scheduler_state
+                torch.save(candidate, checkpoint)
+                with self.assertRaisesRegex(ValueError, "scheduler"):
+                    preflight_startup_checkpoint(
+                        "resume",
+                        checkpoint,
+                        expected_schema=self.model,
+                        expected_contract=self.contract,
+                    )
+
+    def test_manually_constructed_preflight_without_private_bytes_is_rejected(self) -> None:
+        path = self.root / "author.pth"
+        torch.save(self.model.state_dict(), path)
+        generated = preflight_startup_checkpoint(
+            "init_checkpoint",
+            path,
+            expected_schema=self.model,
+            expected_contract=self.contract,
+        )
+        manual = type(generated)(
+            generated.mode,
+            generated.path,
+            generated.sha256,
+            generated.payload,
+            generated.load_report,
+            None,
+        )
+        with self.assertRaisesRegex(ValueError, "private byte snapshot"):
+            load_initial_weights(manual, model=self.model)
+
     def test_contract_allows_only_increased_total_epochs(self) -> None:
         current = dict(self.contract)
         current["total_epochs"] = 8
@@ -379,6 +461,7 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
         self.assertEqual(set(result), {"last.ckpt", "metrics.csv"})
         self.assertNotEqual((run / "last.ckpt").read_bytes(), b"old-last")
         self.assertEqual((run / "metrics.csv").read_bytes(), b"new-metrics")
+        self.assertEqual(len(tuple(run.glob(".*.bak"))), 1)
 
     def test_retention_keeps_milestones_and_latest_aliases(self) -> None:
         run = self.root / "run"

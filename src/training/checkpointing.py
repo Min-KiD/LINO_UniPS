@@ -425,15 +425,83 @@ def _validate_optimizer_state(value: object) -> None:
 def _validate_scheduler_state(value: object) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("scheduler_state_dict must be a mapping")
-    if any(not isinstance(key, str) for key in value):
-        raise ValueError("scheduler_state_dict keys must be strings")
+    required = {
+        "step_size",
+        "gamma",
+        "base_lrs",
+        "last_epoch",
+        "verbose",
+        "_step_count",
+        "_get_lr_called_within_step",
+        "_last_lr",
+    }
+    if set(value) != required:
+        raise ValueError("scheduler_state_dict is not the exact StepLR state schema")
+    if (
+        isinstance(value["step_size"], bool)
+        or not isinstance(value["step_size"], int)
+        or value["step_size"] <= 0
+        or isinstance(value["last_epoch"], bool)
+        or not isinstance(value["last_epoch"], int)
+        or value["last_epoch"] < -1
+        or isinstance(value["_step_count"], bool)
+        or not isinstance(value["_step_count"], int)
+        or value["_step_count"] < 1
+        or not isinstance(value["verbose"], bool)
+        or not isinstance(value["_get_lr_called_within_step"], bool)
+    ):
+        raise ValueError("scheduler_state_dict has invalid StepLR scalar fields")
+    if (
+        isinstance(value["gamma"], bool)
+        or not isinstance(value["gamma"], (int, float))
+        or not np.isfinite(value["gamma"])
+        or value["gamma"] <= 0
+    ):
+        raise ValueError("scheduler_state_dict.gamma must be a positive finite number")
+    base_lrs, last_lrs = value["base_lrs"], value["_last_lr"]
+    if (
+        not isinstance(base_lrs, (list, tuple))
+        or not base_lrs
+        or not isinstance(last_lrs, (list, tuple))
+        or len(last_lrs) != len(base_lrs)
+        or any(
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not np.isfinite(rate)
+            for rate in (*base_lrs, *last_lrs)
+        )
+    ):
+        raise ValueError("scheduler_state_dict learning-rate lists are invalid")
     _validate_cpu_structure(value, "scheduler_state_dict")
 
 
-def _validate_rng_state(value: object) -> None:
+def _validate_scheduler_against_contract(
+    value: Mapping[str, object],
+    optimizer_state: Mapping[str, object],
+    contract: Mapping[str, object],
+) -> None:
+    groups = optimizer_state["param_groups"]
+    if len(value["base_lrs"]) != len(groups):  # type: ignore[arg-type]
+        raise ValueError("scheduler_state_dict does not match optimizer param_groups")
+    snapshot = contract["config_snapshot"]
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("run_contract config_snapshot must be a mapping")
+    configured_step = snapshot.get("scheduler_step_size")
+    if configured_step is not None and value["step_size"] != configured_step:
+        raise ValueError("scheduler_state_dict.step_size conflicts with run contract")
+    configured_gamma = snapshot.get("scheduler_gamma")
+    if configured_gamma is not None and value["gamma"] != configured_gamma:
+        raise ValueError("scheduler_state_dict.gamma conflicts with run contract")
+
+
+def _validate_rng_state(value: object, contract: Mapping[str, object] | None = None) -> None:
     if not isinstance(value, Mapping) or set(value) != {"python", "numpy", "torch", "cuda"}:
         raise ValueError("rng_state must contain python, numpy, torch, and cuda")
     python_state = value["python"]
+    try:
+        random.Random().setstate(copy.deepcopy(python_state))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rng_state.python is not accepted by random.Random.setstate") from exc
     if (
         not isinstance(python_state, tuple)
         or len(python_state) != 3
@@ -466,18 +534,48 @@ def _validate_rng_state(value: object) -> None:
         raise ValueError("rng_state.numpy has an invalid NumPy state")
     if not np.isfinite(float(numpy_state[4])):
         raise ValueError("rng_state.numpy cache is non-finite")
+    try:
+        np.random.RandomState().set_state(
+            (
+                numpy_state[0],
+                numpy_state[1].copy(),
+                numpy_state[2],
+                numpy_state[3],
+                numpy_state[4],
+            )
+        )
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError("rng_state.numpy is not accepted by RandomState.set_state") from exc
     torch_state = value["torch"]
+    expected_torch_bytes = int(torch.Generator(device="cpu").get_state().numel())
     if (
         not isinstance(torch_state, torch.Tensor)
         or torch_state.device.type != "cpu"
         or torch_state.dtype != torch.uint8
         or torch_state.ndim != 1
         or torch_state.numel() == 0
+        or torch_state.numel() != expected_torch_bytes
     ):
         raise ValueError("rng_state.torch has an invalid CPU uint8 state")
+    try:
+        torch.Generator(device="cpu").set_state(torch_state.detach().clone())
+    except (RuntimeError, TypeError) as exc:
+        raise ValueError("rng_state.torch is not accepted by a CPU generator") from exc
     cuda_states = value["cuda"]
     if not isinstance(cuda_states, (list, tuple)):
         raise ValueError("rng_state.cuda must be a list of CPU uint8 states")
+    expected_cuda_count: int | None = None
+    if contract is not None:
+        raw_count = contract.get("cuda_device_count")
+        runtime_versions = contract.get("runtime_versions")
+        if raw_count is None and isinstance(runtime_versions, Mapping):
+            raw_count = runtime_versions.get("cuda_device_count")
+        if raw_count is not None:
+            if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 0:
+                raise ValueError("run_contract cuda_device_count is invalid")
+            expected_cuda_count = int(raw_count)
+    if expected_cuda_count is not None and len(cuda_states) != expected_cuda_count:
+        raise ValueError("rng_state.cuda count conflicts with run contract")
     for index, state in enumerate(cuda_states):
         if (
             not isinstance(state, torch.Tensor)
@@ -485,6 +583,7 @@ def _validate_rng_state(value: object) -> None:
             or state.dtype != torch.uint8
             or state.ndim != 1
             or state.numel() == 0
+            or state.numel() != expected_torch_bytes
         ):
             raise ValueError(f"rng_state.cuda[{index}] has an invalid CPU uint8 state")
 
@@ -545,9 +644,7 @@ def _fresh_preflight_payload(preflight: StartupCheckpointPreflight) -> Mapping[s
     """Reparse private preflight bytes into fresh CPU objects at load time."""
 
     if preflight._raw_bytes is None:
-        if preflight.payload is None:
-            raise ValueError("checkpoint preflight has no private byte snapshot")
-        return _as_mapping(preflight.payload, "checkpoint preflight payload")
+        raise ValueError("checkpoint preflight has no private byte snapshot")
     digest = sha256_bytes(preflight._raw_bytes)
     if preflight.sha256 != digest:
         raise ValueError("checkpoint preflight byte snapshot digest changed")
@@ -814,12 +911,15 @@ def preflight_startup_checkpoint(
         raise ValueError("resume checkpoint artifact_kind is not full private-training .ckpt")
     state = _as_mapping(payload_mapping["model_state_dict"], "model_state_dict")
     report = _schema_check(state, normalized_schema, allow_author_extras=False)
-    _validate_optimizer_state(payload_mapping["optimizer_state_dict"])
-    _validate_scheduler_state(payload_mapping["scheduler_state_dict"])
+    optimizer_state = payload_mapping["optimizer_state_dict"]
+    scheduler_state = payload_mapping["scheduler_state_dict"]
+    _validate_optimizer_state(optimizer_state)
+    _validate_scheduler_state(scheduler_state)
     progress = _validate_progress(payload_mapping["progress"])
     best = _validate_best(payload_mapping["best_metrics"])
-    _validate_rng_state(payload_mapping["rng_state"])
     contract = _validate_run_contract(payload_mapping["run_contract"])
+    _validate_scheduler_against_contract(scheduler_state, optimizer_state, contract)  # type: ignore[arg-type]
+    _validate_rng_state(payload_mapping["rng_state"], contract)
     if expected_contract is not None:
         _contract_compatible(contract, expected_contract)
     report.update(
@@ -918,7 +1018,12 @@ def save_resume_checkpoint(
     }
     _validate_optimizer_state(payload["optimizer_state_dict"])
     _validate_scheduler_state(payload["scheduler_state_dict"])
-    _validate_rng_state(payload["rng_state"])
+    _validate_scheduler_against_contract(
+        payload["scheduler_state_dict"],  # type: ignore[arg-type]
+        payload["optimizer_state_dict"],  # type: ignore[arg-type]
+        contract,
+    )
+    _validate_rng_state(payload["rng_state"], contract)
     _atomic_replace(checkpoint, _torch_bytes(payload), label="private-training checkpoint")
     return checkpoint
 
