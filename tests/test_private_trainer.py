@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import csv
 import json
+import contextlib
 import tempfile
 import unittest
 import weakref
 from pathlib import Path
+from unittest import mock
 
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset
@@ -16,6 +19,7 @@ from torch.utils.data import Dataset
 from src.training.config import PrivateTrainConfig
 from src.training.private_manifest import PrivateObjectRecord, PrivateSplitManifest
 from src.training.trainer import (
+    _load_metric_rows,
     create_optimizer_scheduler,
     run_private_training,
     validate_epoch,
@@ -67,6 +71,26 @@ class _TinyReleasedModel(nn.Module):
             batch["imgs"].shape[3],
             dtype=torch.float32,
         )
+
+
+class _NumpyRandomValidationModel(_TinyReleasedModel):
+    def model_step(self, batch):
+        super().model_step(batch)
+        values = np.random.random((batch["imgs"].shape[0], 3, 512, 512))
+        return torch.from_numpy(values.astype(np.float32))
+
+
+class _DtypeCheckedValidationModel(_TinyReleasedModel):
+    def __init__(self):
+        super().__init__()
+        self.autocast_seen = False
+
+    def model_step(self, batch):
+        del batch
+        self.autocast_seen = bool(getattr(self, "_autocast_marker", False))
+        if not self.autocast_seen:
+            raise RuntimeError("validation requires BF16 autocast")
+        return torch.zeros(1, 3, 512, 512)
 
 
 class _TinyDataset(Dataset):
@@ -247,6 +271,25 @@ class PrivateTrainerTests(unittest.TestCase):
             rows = list(csv.DictReader(stream))
         self.assertEqual([int(row["epoch"]) for row in rows], [1, 2])
 
+    def test_resume_metric_boundary_fails_before_live_model(self):
+        first = run_private_training(self.config(epochs=1), **self.dependencies())
+        (first.run_dir / "metrics.csv").unlink()
+        events = []
+
+        def model_factory():
+            events.append("model")
+            return _TinyReleasedModel()
+
+        with self.assertRaisesRegex(ValueError, "metrics.csv"):
+            run_private_training(
+                self.config(epochs=2, startup_mode="resume", resume=first.last_checkpoint),
+                model_factory=model_factory,
+                manifest_builder=self.manifests,
+                schema_provider=lambda: (("scale", (), "torch.float32"),),
+                device_resolver=lambda value: events.append(value),
+            )
+        self.assertEqual(events, [])
+
     def test_smoke_mode_is_isolated_and_non_comparable(self):
         summary = run_private_training(self.config(epochs=1), smoke=True, **self.dependencies())
         self.assertEqual(summary.run_dir, self.config().save_dir / "smoke")
@@ -261,6 +304,74 @@ class PrivateTrainerTests(unittest.TestCase):
         self.assertEqual(model.model_step_keys, {"imgs", "mask"})
         self.assertFalse(model.training_during_model_step)
         self.assertFalse(model.grad_enabled_during_model_step)
+
+    def test_validation_wraps_released_call_in_precision_context(self):
+        model = _DtypeCheckedValidationModel()
+        sample = _sample("object.data")
+        loader = [{
+            **{key: value.unsqueeze(0) for key, value in sample.items() if isinstance(value, torch.Tensor)},
+            "metadata": [sample["metadata"]],
+        }]
+
+        @contextlib.contextmanager
+        def marker(_device, _precision):
+            model._autocast_marker = True
+            try:
+                yield
+            finally:
+                model._autocast_marker = False
+
+        with mock.patch("src.training.trainer._autocast", marker):
+            validate_epoch(model, loader, self.config(), source_predictor=lambda prediction, batch: prediction)
+        self.assertTrue(model.autocast_seen)
+
+    def test_validation_restores_numpy_state_and_groups_by_object_seed(self):
+        model = _NumpyRandomValidationModel()
+        sample = _sample("object.data")
+        loader = [{
+            **{key: value.unsqueeze(0) for key, value in sample.items() if isinstance(value, torch.Tensor)},
+            "metadata": [sample["metadata"]],
+        }]
+        np.random.seed(91)
+        before = np.random.get_state()
+        first = validate_epoch(model, loader, self.config(), source_predictor=lambda prediction, batch: prediction)
+        after = np.random.get_state()
+        self.assertEqual(before[0], after[0])
+        self.assertTrue(np.array_equal(before[1], after[1]))
+        np.random.seed(77123)
+        second = validate_epoch(model, loader, self.config(), source_predictor=lambda prediction, batch: prediction)
+        self.assertEqual(first.mae, second.mae)
+
+    def test_metric_csv_rows_require_exact_contiguous_finite_prefix(self):
+        path = self.root / "metrics.csv"
+        path.write_text(
+            "epoch,train_loss,train_mae,validation_loss,validation_mae,learning_rate,global_step,epoch_seconds,peak_cuda_allocated_bytes,peak_cuda_reserved_bytes\n"
+            "1,1,2,3,4,0.1,1,2,,\n"
+            "3,1,2,3,4,0.1,2,2,,\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "contiguous|epoch"):
+            _load_metric_rows(path)
+
+    def test_failed_epoch_publication_preserves_previous_bundle(self):
+        first = run_private_training(self.config(epochs=1), **self.dependencies())
+        metrics_before = (first.run_dir / "metrics.csv").read_bytes()
+        checkpoint_before = first.last_checkpoint.read_bytes()
+        with mock.patch(
+            "src.training.trainer.publish_tree_artifacts",
+            side_effect=ValueError("directory was replaced during publication"),
+        ):
+            with self.assertRaisesRegex(ValueError, "publication|replaced"):
+                run_private_training(
+                    self.config(
+                        epochs=2,
+                        startup_mode="resume",
+                        resume=first.last_checkpoint,
+                    ),
+                    **self.dependencies(),
+                )
+        self.assertEqual((first.run_dir / "metrics.csv").read_bytes(), metrics_before)
+        self.assertEqual(first.last_checkpoint.read_bytes(), checkpoint_before)
 
     def test_bad_startup_checkpoint_fails_before_live_model_or_cuda(self):
         events = []

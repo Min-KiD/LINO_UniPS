@@ -14,12 +14,10 @@ import csv
 import inspect
 import io
 import json
-import os
 import platform
-import shutil
 import tempfile
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -41,7 +39,7 @@ from src.training.checkpointing import (
     load_initial_weights,
     load_resume_checkpoint,
     preflight_startup_checkpoint,
-    publish_epoch_artifacts,
+    publish_tree_artifacts,
     save_resume_checkpoint,
     schema_fingerprint,
 )
@@ -58,7 +56,12 @@ from src.training.private_manifest import (
     build_private_split_manifest,
     private_manifest_sha256,
 )
-from src.training.reproducibility import epoch_permutation, seed_everything, seed_worker
+from src.training.reproducibility import (
+    epoch_permutation,
+    seed_everything,
+    seed_worker,
+    stable_seed,
+)
 
 
 METRIC_FIELDS = (
@@ -190,6 +193,18 @@ def _cuda_peak(device: torch.device) -> tuple[int | None, int | None]:
     if device.type != "cuda":
         return None, None
     return int(torch.cuda.max_memory_allocated(device)), int(torch.cuda.max_memory_reserved(device))
+
+
+@contextmanager
+def _preserve_validation_numpy_state(seed: int):
+    """Seed released NumPy pixel grouping without perturbing caller state."""
+
+    state = np.random.get_state()
+    np.random.seed(int(seed))
+    try:
+        yield
+    finally:
+        np.random.set_state(state)
 
 
 def train_epoch(
@@ -337,12 +352,31 @@ def validate_epoch(
                 "imgs": _batch_tensor(batch, "imgs", device),
                 "mask": _batch_tensor(batch, "model_mask", device),
             }
-            prediction = model.model_step(released_batch)
-            if source_predictor is not None:
-                prediction = _invoke_source_predictor(source_predictor, model, prediction, batch)
-                arrays = list(prediction) if isinstance(prediction, (list, tuple)) else _prediction_arrays(prediction, batch)
-            else:
-                arrays = _prediction_arrays(prediction, batch)
+            names = _metadata_names(batch, int(released_batch["imgs"].shape[0]))
+            if len(names) != 1:
+                raise ValueError("validation loader must use batch size one")
+            validation_seed = stable_seed(
+                config.seed,
+                "test",
+                0,
+                names[0],
+                "pixel_grouping",
+            )
+            with _autocast(device, config.precision):
+                with _preserve_validation_numpy_state(validation_seed):
+                    prediction = model.model_step(released_batch)
+                    if source_predictor is not None:
+                        prediction = _invoke_source_predictor(
+                            source_predictor,
+                            model,
+                            prediction,
+                            batch,
+                        )
+                    arrays = (
+                        list(prediction)
+                        if isinstance(prediction, (list, tuple))
+                        else _prediction_arrays(prediction, batch)
+                    )
             targets = _batch_tensor(batch, "source_target_normal", device).detach().cpu().numpy()
             masks = _batch_tensor(batch, "source_target_mask", device).detach().cpu().numpy()
             if len(arrays) != int(targets.shape[0]):
@@ -431,6 +465,26 @@ def _save_json(path: Path, value: Mapping[str, object]) -> None:
 
 
 def _metric_bytes(rows: Sequence[EpochMetrics]) -> bytes:
+    expected_epochs = list(range(1, len(rows) + 1))
+    if [row.epoch for row in rows] != expected_epochs:
+        raise ValueError("metrics rows must form a contiguous epoch prefix")
+    previous_step = -1
+    for row in rows:
+        if any(
+            not np.isfinite(float(value))
+            for value in (
+                row.train_loss,
+                row.train_mae,
+                row.validation_loss,
+                row.validation_mae,
+                row.learning_rate,
+                row.epoch_seconds,
+            )
+        ):
+            raise ValueError("metrics rows must contain finite values")
+        if row.global_step < previous_step:
+            raise ValueError("metrics rows global_step must be monotonic")
+        previous_step = row.global_step
     stream = io.StringIO()
     writer = csv.DictWriter(stream, fieldnames=METRIC_FIELDS)
     writer.writeheader()
@@ -455,93 +509,63 @@ def _load_metric_rows(path: Path) -> list[EpochMetrics]:
         return []
     rows: list[EpochMetrics] = []
     with path.open(newline="", encoding="utf-8") as stream:
-        for raw in csv.DictReader(stream):
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != METRIC_FIELDS:
+            raise ValueError("metrics.csv header does not match the exact trainer schema")
+        for expected_epoch, raw in enumerate(reader, start=1):
+            if None in raw or any(value is None for value in raw.values()):
+                raise ValueError("metrics.csv contains an incomplete row")
+            try:
+                epoch = int(raw["epoch"])
+                global_step = int(raw["global_step"])
+                peak_allocated = (
+                    int(raw["peak_cuda_allocated_bytes"])
+                    if raw["peak_cuda_allocated_bytes"]
+                    else None
+                )
+                peak_reserved = (
+                    int(raw["peak_cuda_reserved_bytes"])
+                    if raw["peak_cuda_reserved_bytes"]
+                    else None
+                )
+                numeric = {
+                    key: float(raw[key])
+                    for key in (
+                        "train_loss",
+                        "train_mae",
+                        "validation_loss",
+                        "validation_mae",
+                        "learning_rate",
+                        "epoch_seconds",
+                    )
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("metrics.csv contains an invalid numeric row") from exc
+            if epoch != expected_epoch or epoch <= 0:
+                raise ValueError("metrics.csv epochs must be a contiguous prefix")
+            if global_step < 0 or (rows and global_step < rows[-1].global_step):
+                raise ValueError("metrics.csv global_step must be nonnegative and monotonic")
+            if peak_allocated is not None and peak_allocated < 0:
+                raise ValueError("metrics.csv allocated bytes must be nonnegative")
+            if peak_reserved is not None and peak_reserved < 0:
+                raise ValueError("metrics.csv reserved bytes must be nonnegative")
+            if any(not np.isfinite(value) for value in numeric.values()):
+                raise ValueError("metrics.csv contains non-finite metrics")
             rows.append(EpochMetrics(
-                epoch=int(raw["epoch"]),
-                train_loss=float(raw["train_loss"]),
-                train_mae=float(raw["train_mae"]),
-                validation_loss=float(raw["validation_loss"]),
-                validation_mae=float(raw["validation_mae"]),
-                learning_rate=float(raw["learning_rate"]),
-                global_step=int(raw["global_step"]),
-                epoch_seconds=float(raw["epoch_seconds"]),
-                peak_cuda_allocated_bytes=int(raw["peak_cuda_allocated_bytes"]) if raw.get("peak_cuda_allocated_bytes") else None,
-                peak_cuda_reserved_bytes=int(raw["peak_cuda_reserved_bytes"]) if raw.get("peak_cuda_reserved_bytes") else None,
+                epoch=epoch,
+                train_loss=numeric["train_loss"],
+                train_mae=numeric["train_mae"],
+                validation_loss=numeric["validation_loss"],
+                validation_mae=numeric["validation_mae"],
+                learning_rate=numeric["learning_rate"],
+                global_step=global_step,
+                epoch_seconds=numeric["epoch_seconds"],
+                peak_cuda_allocated_bytes=peak_allocated,
+                peak_cuda_reserved_bytes=peak_reserved,
             ))
+    if not rows:
+        raise ValueError("metrics.csv contains no completed epoch rows")
     return rows
-
-
-def _publish_bundle(
-    run_dir: Path,
-    *,
-    epoch: int,
-    checkpoint_bytes: bytes,
-    export_weights: bytes,
-    export_sidecar: bytes,
-    metrics: bytes,
-    best: bool,
-    model: torch.nn.Module,
-    model_factory: Callable[[], torch.nn.Module],
-) -> None:
-    """Validate one staged bundle, then publish all public aliases together."""
-
-    stage = Path(tempfile.mkdtemp(prefix=f".epoch-{epoch:03d}-", dir=run_dir))
-    try:
-        validated = publish_epoch_artifacts(
-            stage,
-            artifacts={
-                "epoch.ckpt": checkpoint_bytes,
-                "epoch.pth": export_weights,
-                "epoch.json": export_sidecar,
-                "metrics.csv": metrics,
-            },
-        )
-        staged = {name: path.read_bytes() for name, path in validated.items()}
-        destinations: dict[Path, bytes] = {
-            run_dir / "metrics.csv": staged["metrics.csv"],
-            run_dir / "checkpoints" / "last.ckpt": staged["epoch.ckpt"],
-            run_dir / "checkpoints" / f"lino_epoch_{epoch:03d}.ckpt": staged["epoch.ckpt"],
-            run_dir / "exports" / f"lino_epoch_{epoch:03d}.pth": staged["epoch.pth"],
-            run_dir / "exports" / f"lino_epoch_{epoch:03d}.json": staged["epoch.json"],
-        }
-        if best:
-            destinations[run_dir / "checkpoints" / "best_validation.ckpt"] = staged["epoch.ckpt"]
-            destinations[run_dir / "exports" / "lino_best_validation.pth"] = staged["epoch.pth"]
-            destinations[run_dir / "exports" / "lino_best_validation.json"] = staged["epoch.json"]
-        old: dict[Path, bytes | None] = {}
-        temporary: dict[Path, Path] = {}
-        try:
-            for destination, payload in destinations.items():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                old[destination] = destination.read_bytes() if destination.exists() else None
-                fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(payload)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                temporary[destination] = Path(name)
-            for destination, source in temporary.items():
-                os.replace(source, destination)
-            for parent in {destination.parent for destination in destinations}:
-                try:
-                    fd = os.open(parent, os.O_RDONLY)
-                    try:
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    pass
-        except Exception:
-            for destination, source in temporary.items():
-                if source.exists():
-                    source.unlink()
-                if old.get(destination) is None:
-                    destination.unlink(missing_ok=True)
-                else:
-                    destination.write_bytes(old[destination])
-            raise
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
 
 
 def run_private_training(
@@ -599,6 +623,16 @@ def run_private_training(
     # and contract filenames remain the canonical artifacts.
     _save_json(run_dir / "resolved_config.json", resolved)
     _save_json(run_dir / "run_contract.json", contract)
+    existing_rows = _load_metric_rows(run_dir / "metrics.csv") if config.startup_mode == "resume" else []
+    if config.startup_mode == "resume":
+        startup_progress = startup.load_report.get("progress")
+        if not isinstance(startup_progress, Mapping):
+            raise ValueError("resume checkpoint preflight has no progress report")
+        expected_completed = int(startup_progress["completed_epoch"])
+        if expected_completed > 0 and not existing_rows:
+            raise ValueError("resume requires metrics.csv through completed_epoch")
+        if existing_rows and existing_rows[-1].epoch != expected_completed:
+            raise ValueError("resume metrics.csv does not end at checkpoint completed_epoch")
     device = device_resolver(config.device)
     if config.precision == "bf16" and device.type != "cuda":
         raise RuntimeError("private LINO bf16 training requires CUDA")
@@ -631,7 +665,6 @@ def run_private_training(
     test_dataset = dataset_factory(config, test_manifest, split="test")
     if len(train_dataset) <= 0 or len(test_dataset) <= 0:
         raise ValueError("private training and validation datasets must be nonempty")
-    existing_rows = _load_metric_rows(run_dir / "metrics.csv") if config.startup_mode == "resume" else []
     if config.startup_mode == "resume" and progress_epoch > 0 and not existing_rows:
         raise ValueError("resume requires metrics.csv through completed_epoch")
     if existing_rows and existing_rows[-1].epoch != progress_epoch:
@@ -738,17 +771,24 @@ def run_private_training(
                 contract=contract,
             )
             checkpoint_bytes = temp_checkpoint.read_bytes()
-            _publish_bundle(
-                run_dir,
-                epoch=metrics.epoch,
-                checkpoint_bytes=checkpoint_bytes,
-                export_weights=export_weights,
-                export_sidecar=export_sidecar,
-                metrics=_metric_bytes(next_rows),
-                best=is_best,
-                model=model,
-                model_factory=factory,
+            artifacts = {
+                "metrics.csv": _metric_bytes(next_rows),
+                "checkpoints/last.ckpt": checkpoint_bytes,
+            }
+            publish_epoch_artifact = (
+                metrics.epoch % config.save_every_epochs == 0
+                or metrics.epoch == config.epochs
+                or metrics.epoch in config.keep_milestone_epochs
             )
+            if publish_epoch_artifact:
+                artifacts[f"checkpoints/lino_epoch_{metrics.epoch:03d}.ckpt"] = checkpoint_bytes
+                artifacts[f"exports/lino_epoch_{metrics.epoch:03d}.pth"] = export_weights
+                artifacts[f"exports/lino_epoch_{metrics.epoch:03d}.json"] = export_sidecar
+            if is_best:
+                artifacts["checkpoints/best_validation.ckpt"] = checkpoint_bytes
+                artifacts["exports/lino_best_validation.pth"] = export_weights
+                artifacts["exports/lino_best_validation.json"] = export_sidecar
+            publish_tree_artifacts(run_dir, artifacts=artifacts)
         rows = next_rows
         final_export = run_dir / "exports" / f"lino_epoch_{metrics.epoch:03d}.pth"
         apply_artifact_retention(

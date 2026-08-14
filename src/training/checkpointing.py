@@ -34,8 +34,10 @@ import torch
 
 from src.comparison.provenance import (
     _secure_directory_flags,
+    assert_directory_path_identity,
     atomic_replace_bytes_at_fd,
     canonical_json_bytes,
+    directory_identity,
     ensure_real_directory,
     open_or_create_directory,
     read_regular_bytes_at_fd,
@@ -918,6 +920,10 @@ def preflight_startup_checkpoint(
     progress = _validate_progress(payload_mapping["progress"])
     best = _validate_best(payload_mapping["best_metrics"])
     contract = _validate_run_contract(payload_mapping["run_contract"])
+    if progress.completed_epoch > int(contract["total_epochs"]):
+        raise ValueError(
+            "progress.completed_epoch exceeds run_contract.total_epochs"
+        )
     _validate_scheduler_against_contract(scheduler_state, optimizer_state, contract)  # type: ignore[arg-type]
     _validate_rng_state(payload_mapping["rng_state"], contract)
     if expected_contract is not None:
@@ -1414,6 +1420,226 @@ def publish_epoch_artifacts(
                 pass
 
 
+def _safe_relative_artifact_parts(name: str) -> tuple[str, ...]:
+    """Validate a safe relative artifact path without traversal."""
+
+    if not isinstance(name, str) or not name or "\\" in name:
+        raise ValueError(f"artifact path must be safe and relative: {name!r}")
+    parts = tuple(name.split("/"))
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"artifact path must be safe and relative: {name!r}")
+    for part in parts:
+        _safe_artifact_name(part)
+    return parts
+
+
+def _open_tree_child_directory(
+    parent_fd: int,
+    parent_identity: tuple[int, int],
+    name: str,
+    *,
+    label: str,
+) -> tuple[int, tuple[int, int]]:
+    """Open/create one no-follow child while retaining its parent FD."""
+
+    info = os.fstat(parent_fd)
+    if (int(info.st_dev), int(info.st_ino)) != parent_identity:
+        raise ValueError(f"{label} parent directory was replaced")
+    try:
+        child_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise ValueError(f"{label} appeared during secure creation") from exc
+        child_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be inspected") from exc
+    if stat.S_ISLNK(child_info.st_mode) or not stat.S_ISDIR(child_info.st_mode):
+        raise ValueError(f"{label} must be a real directory, not a symlink")
+    expected = (int(child_info.st_dev), int(child_info.st_ino))
+    try:
+        child_fd = os.open(name, _secure_directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be opened") from exc
+    try:
+        actual_info = os.fstat(child_fd)
+        actual = (int(actual_info.st_dev), int(actual_info.st_ino))
+        if actual != expected:
+            raise ValueError(f"{label} was replaced while opening")
+        return child_fd, actual
+    except Exception:
+        try:
+            os.close(child_fd)
+        except OSError:
+            pass
+        raise
+
+
+def publish_tree_artifacts(
+    run_dir: str | Path,
+    *,
+    artifacts: Mapping[str, bytes],
+) -> Mapping[str, Path]:
+    """Publish one rollback-safe bundle spanning nested artifact paths."""
+
+    if not isinstance(artifacts, Mapping) or not artifacts:
+        raise ValueError("tree artifact bundle must not be empty")
+    merged: dict[str, bytes] = {}
+    parts_by_name: dict[str, tuple[str, ...]] = {}
+    for raw_name, payload in artifacts.items():
+        parts = _safe_relative_artifact_parts(raw_name)
+        normalized = "/".join(parts)
+        if normalized in merged:
+            raise ValueError(f"duplicate tree artifact path: {normalized}")
+        if not isinstance(payload, bytes):
+            raise TypeError(f"artifact {normalized} payload must be bytes")
+        _validate_staged_artifact(parts[-1], payload)
+        merged[normalized] = payload
+        parts_by_name[normalized] = parts
+
+    destination = Path(run_dir)
+    ensure_real_directory(destination, label="tree artifact directory")
+    root_fd: int | None = None
+    handles: dict[tuple[str, ...], tuple[int, tuple[int, int], Path]] = {}
+    staged: dict[str, tuple[int, str]] = {}
+    backups: dict[str, tuple[int, str]] = {}
+    old_exists: dict[str, bool] = {}
+    replaced: list[str] = []
+
+    def get_handle(parts: tuple[str, ...]) -> tuple[int, tuple[int, int], Path]:
+        if parts in handles:
+            return handles[parts]
+        if not parts:
+            if root_fd is None:
+                raise ValueError("tree artifact root is not open")
+            path_identity = directory_identity(destination, label="tree artifact directory")
+            identity = (int(path_identity["dev"]), int(path_identity["ino"]))
+            handle = (root_fd, (int(identity[0]), int(identity[1])), destination.resolve())
+            handles[parts] = handle
+            return handle
+        parent_fd, parent_identity, _parent_path = get_handle(parts[:-1])
+        child_fd, child_identity = _open_tree_child_directory(
+            parent_fd,
+            parent_identity,
+            parts[-1],
+            label=f"tree artifact directory {'/'.join(parts)}",
+        )
+        handle = (child_fd, child_identity, destination / Path(*parts))
+        handles[parts] = handle
+        return handle
+
+    try:
+        root_fd, root_opened, root_path = open_or_create_directory(
+            destination,
+            label="tree artifact directory",
+        )
+        root_identity = (int(root_opened["dev"]), int(root_opened["ino"]))
+        handles[()] = (root_fd, root_identity, root_path)
+        for normalized in sorted(merged):
+            get_handle(parts_by_name[normalized][:-1])
+
+        for normalized in sorted(merged):
+            parts = parts_by_name[normalized]
+            fd = handles[parts[:-1]][0]
+            staged[normalized] = (fd, _stage_file(fd, parts[-1], merged[normalized]))
+
+        for normalized in sorted(merged):
+            parts = parts_by_name[normalized]
+            fd = handles[parts[:-1]][0]
+            name = parts[-1]
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                old_exists[normalized] = False
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ValueError(f"tree artifact destination must be a regular file: {normalized}")
+            old_exists[normalized] = True
+            backup_name = f".{name}.{secrets.token_hex(12)}.bak"
+            os.link(name, backup_name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+            backups[normalized] = (fd, backup_name)
+
+        for _parts, (fd, identity, path) in handles.items():
+            current = os.fstat(fd)
+            if (int(current.st_dev), int(current.st_ino)) != identity:
+                raise ValueError(f"tree artifact directory was replaced: {path}")
+            assert_directory_path_identity(
+                path,
+                {"dev": identity[0], "ino": identity[1]},
+                label=f"tree artifact directory {path}",
+            )
+
+        for normalized in sorted(merged):
+            parts = parts_by_name[normalized]
+            fd, temporary = staged[normalized]
+            os.replace(temporary, parts[-1], src_dir_fd=fd, dst_dir_fd=fd)
+            staged[normalized] = (fd, "")
+            replaced.append(normalized)
+        for fd, _identity, _path in handles.values():
+            os.fsync(fd)
+        for _parts, (_fd, identity, path) in handles.items():
+            assert_directory_path_identity(
+                path,
+                {"dev": identity[0], "ino": identity[1]},
+                label=f"tree artifact directory {path}",
+            )
+
+        # Cleanup is post-commit.  A failed unlink leaves a hidden backup but
+        # never re-enters rollback after the public bundle is committed.
+        for normalized, (fd, backup_name) in list(backups.items()):
+            try:
+                os.unlink(backup_name, dir_fd=fd)
+            except OSError:
+                continue
+            backups.pop(normalized, None)
+        return {
+            normalized: destination / Path(*parts_by_name[normalized])
+            for normalized in merged
+        }
+    except Exception as exc:
+        for normalized in reversed(replaced):
+            parts = parts_by_name[normalized]
+            fd = handles[parts[:-1]][0]
+            try:
+                if old_exists.get(normalized, False) and normalized in backups:
+                    os.replace(backups[normalized][1], parts[-1], src_dir_fd=fd, dst_dir_fd=fd)
+                    backups.pop(normalized, None)
+                elif not old_exists.get(normalized, False):
+                    os.unlink(parts[-1], dir_fd=fd)
+            except OSError:
+                pass
+        for normalized, (fd, backup_name) in list(backups.items()):
+            try:
+                os.unlink(backup_name, dir_fd=fd)
+            except OSError:
+                pass
+        for fd, temporary in staged.values():
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=fd)
+                except OSError:
+                    pass
+        for fd, _identity, _path in handles.values():
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+        if isinstance(exc, (TypeError, ValueError)):
+            raise
+        raise ValueError("failed to publish tree artifact bundle; previous bundle restored") from exc
+    finally:
+        closed: set[int] = set()
+        for fd, _identity, _path in reversed(tuple(handles.values())):
+            if fd in closed:
+                continue
+            closed.add(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def apply_artifact_retention(
     run_dir: str | Path,
     *,
@@ -1476,6 +1702,7 @@ __all__ = [
     "load_resume_checkpoint",
     "preflight_startup_checkpoint",
     "publish_epoch_artifacts",
+    "publish_tree_artifacts",
     "restore_rng_state",
     "save_resume_checkpoint",
     "schema_fingerprint",

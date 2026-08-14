@@ -27,6 +27,7 @@ from src.training.checkpointing import (
     load_resume_checkpoint,
     preflight_startup_checkpoint,
     publish_epoch_artifacts,
+    publish_tree_artifacts,
     save_resume_checkpoint,
 )
 
@@ -409,6 +410,98 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
                 scheduler=self.scheduler,
                 expected_contract=current,
             )
+
+    def test_resume_progress_cannot_exceed_saved_contract_total_epochs(self):
+        checkpoint = self.root / "out_of_range.ckpt"
+        save_resume_checkpoint(
+            checkpoint,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            progress=TrainingProgress(completed_epoch=5, next_epoch=6, global_step=1),
+            best=BestMetrics(mae=1.0, loss=1.0, epoch=5),
+            contract=self.contract,
+        )
+        with self.assertRaisesRegex(ValueError, "completed_epoch|total_epochs"):
+            preflight_startup_checkpoint(
+                "resume",
+                checkpoint,
+                expected_schema=self.model,
+                expected_contract=self.contract,
+            )
+
+    def test_tree_bundle_publishes_nested_artifacts(self):
+        run = self.root / "run-tree"
+        checkpoint_bytes = _state_bytes({"artifact_kind": "lino_private_training_checkpoint"})
+        export_bytes = _state_bytes({"linear.weight": torch.ones(1)})
+        result = publish_tree_artifacts(
+            run,
+            artifacts={
+                "metrics.csv": b"new-metrics",
+                "checkpoints/last.ckpt": checkpoint_bytes,
+                "exports/lino_epoch_001.pth": export_bytes,
+            },
+        )
+        self.assertEqual((run / "metrics.csv").read_bytes(), b"new-metrics")
+        self.assertEqual((run / "checkpoints/last.ckpt").read_bytes(), checkpoint_bytes)
+        self.assertEqual((run / "exports/lino_epoch_001.pth").read_bytes(), export_bytes)
+        self.assertEqual(result["checkpoints/last.ckpt"], run / "checkpoints/last.ckpt")
+
+    def test_tree_bundle_rejects_symlinked_child_directory(self):
+        run = self.root / "run-symlink"
+        run.mkdir()
+        target = self.root / "elsewhere"
+        target.mkdir()
+        (run / "checkpoints").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink|real directory|checkpoints"):
+            publish_tree_artifacts(
+                run,
+                artifacts={
+                    "checkpoints/last.ckpt": _state_bytes(
+                        {"artifact_kind": "lino_private_training_checkpoint"}
+                    )
+                },
+            )
+
+    def test_tree_bundle_rolls_back_when_replacement_fails(self):
+        run = self.root / "run-tree-failure"
+        (run / "checkpoints").mkdir(parents=True)
+        (run / "metrics.csv").write_bytes(b"old-metrics")
+        (run / "checkpoints/last.ckpt").write_bytes(b"old-checkpoint")
+        checkpointing = __import__("src.training.checkpointing", fromlist=["os"])
+        original_replace = checkpointing.os.replace
+        calls = {"count": 0}
+        checkpoint_bytes = _state_bytes({"artifact_kind": "lino_private_training_checkpoint"})
+
+        def fail_second_replace(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("replacement failure")
+            return original_replace(*args, **kwargs)
+
+        with mock.patch("src.training.checkpointing.os.replace", side_effect=fail_second_replace):
+            with self.assertRaisesRegex(ValueError, "publish|replacement"):
+                publish_tree_artifacts(
+                    run,
+                    artifacts={
+                        "metrics.csv": b"new-metrics",
+                        "checkpoints/last.ckpt": checkpoint_bytes,
+                    },
+                )
+        self.assertEqual((run / "metrics.csv").read_bytes(), b"old-metrics")
+        self.assertEqual((run / "checkpoints/last.ckpt").read_bytes(), b"old-checkpoint")
+
+    def test_tree_bundle_rejects_directory_identity_swap_before_replacement(self):
+        run = self.root / "run-tree-swap"
+        run.mkdir()
+        (run / "metrics.csv").write_bytes(b"old-metrics")
+        with mock.patch(
+            "src.training.checkpointing.assert_directory_path_identity",
+            side_effect=ValueError("directory was replaced"),
+        ):
+            with self.assertRaisesRegex(ValueError, "replaced"):
+                publish_tree_artifacts(run, artifacts={"metrics.csv": b"new-metrics"})
+        self.assertEqual((run / "metrics.csv").read_bytes(), b"old-metrics")
 
     def test_publication_rolls_back_previous_bundle_on_failure(self) -> None:
         run = self.root / "run"
