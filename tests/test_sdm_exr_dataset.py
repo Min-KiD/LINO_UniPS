@@ -384,9 +384,24 @@ class SdmExrDatasetTests(unittest.TestCase):
         self.assertEqual(sample["metadata"], expected_metadata)
 
     def test_private_version_metadata_exposes_preprocessing_version(self):
-        make_object(self.data_root, "alpha.data")
+        make_object(self.data_root, "alpha.data", image_count=16)
+        selection = self.root / "selected.json"
+        selection.write_text(
+            json.dumps(
+                {"alpha.data": [f"image_{index:03d}.exr" for index in range(16)]}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         config, manifest = self.manifest(
-            preprocessing_version="private_external_lino_native_v1"
+            preprocessing_version="private_external_lino_native_v1",
+            require_checkpoint_data_contract=True,
+            max_image_num=16,
+            light_selection="manifest",
+            selection_manifest=selection,
+            normal_encoding="unsigned",
+            expected_source_geometry=(256, 256),
+            max_image_resolution=512,
         )
         sample = SdmExrDataset(config, manifest)[0]
         self.assertEqual(

@@ -41,7 +41,11 @@ _CONFIG_FIELDS = frozenset(
     }
 )
 _OPTIONAL_CONFIG_FIELDS = frozenset(
-    {"expected_source_geometry", "preprocessing_version"}
+    {
+        "expected_source_geometry",
+        "preprocessing_version",
+        "require_checkpoint_data_contract",
+    }
 )
 
 
@@ -93,6 +97,7 @@ class SdmExrInferenceConfig:
     save_png: bool
     expected_source_geometry: tuple[int, int] | None = None
     preprocessing_version: str = "released_transfer_v1"
+    require_checkpoint_data_contract: bool = False
 
     def __post_init__(self) -> None:
         for name in ("checkpoint", "data_root", "output_root"):
@@ -124,6 +129,48 @@ class SdmExrInferenceConfig:
                 "preprocessing_version must be one of: "
                 "released_transfer_v1, private_external_lino_native_v1"
             )
+        _require_bool(
+            self.require_checkpoint_data_contract,
+            "require_checkpoint_data_contract",
+        )
+        if (
+            self.require_checkpoint_data_contract
+            and self.preprocessing_version != "private_external_lino_native_v1"
+        ):
+            raise ValueError(
+                "require_checkpoint_data_contract requires "
+                "private_external_lino_native_v1"
+            )
+        if self.preprocessing_version == "private_external_lino_native_v1":
+            if not self.require_checkpoint_data_contract:
+                raise ValueError(
+                    "private_external_lino_native_v1 requires "
+                    "require_checkpoint_data_contract"
+                )
+            if self.light_selection != "manifest":
+                raise ValueError(
+                    "private_external_lino_native_v1 requires manifest light_selection"
+                )
+            if self.max_image_num != 16:
+                raise ValueError(
+                    "private_external_lino_native_v1 requires max_image_num 16"
+                )
+            if self.mask_policy != "external":
+                raise ValueError(
+                    "private_external_lino_native_v1 requires external mask_policy"
+                )
+            if self.normal_encoding != "unsigned":
+                raise ValueError(
+                    "private_external_lino_native_v1 requires unsigned normal_encoding"
+                )
+            if self.expected_source_geometry != (256, 256):
+                raise ValueError(
+                    "private_external_lino_native_v1 requires source geometry [256, 256]"
+                )
+            if self.max_image_resolution != 512:
+                raise ValueError(
+                    "private_external_lino_native_v1 requires internal resolution 512"
+                )
         if self.expected_source_geometry is not None:
             if (
                 not isinstance(self.expected_source_geometry, tuple)
@@ -290,6 +337,10 @@ def load_sdm_exr_config(path: str | Path) -> SdmExrInferenceConfig:
         preprocessing_version=_require_text(
             raw.get("preprocessing_version", "released_transfer_v1"),
             "preprocessing_version",
+        ),
+        require_checkpoint_data_contract=_require_bool(
+            raw.get("require_checkpoint_data_contract", False),
+            "require_checkpoint_data_contract",
         ),
         mask_margin=_require_int(raw["mask_margin"], "mask_margin"),
         max_image_resolution=_require_int(

@@ -38,6 +38,7 @@ from .manifest import (
 )
 from .provenance import (
     atomic_replace_bytes_at_fd,
+    canonical_json_bytes,
     config_runtime_fingerprint,
     file_identity,
     lino_preprocessing_snapshot,
@@ -68,6 +69,181 @@ def _precision_dtype(config: SdmExrInferenceConfig) -> torch.dtype:
         "fp16": torch.float16,
         "fp32": torch.float32,
     }[config.precision]
+
+
+def _mapping(value: Any, *, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{label} keys must be strings")
+    return value
+
+
+def _nonempty_text(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
+
+
+def _geometry_pair(value: Any, *, label: str) -> tuple[int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{label} must be a [height, width] pair")
+    if any(type(item) is not int or item <= 0 for item in value):
+        raise ValueError(f"{label} must be a positive [height, width] pair")
+    return int(value[0]), int(value[1])
+
+
+def _checkpoint_schema_fingerprint(checkpoint_bytes: bytes) -> str:
+    """Fingerprint a raw model-only checkpoint without constructing the model."""
+
+    try:
+        payload = torch.load(
+            io.BytesIO(checkpoint_bytes),
+            weights_only=False,
+            map_location="cpu",
+        )
+    except Exception as exc:
+        raise ValueError("LINO checkpoint cannot be parsed for architecture validation") from exc
+    state_dict = payload
+    if isinstance(payload, Mapping) and "state_dict" in payload:
+        state_dict = payload["state_dict"]
+    state_dict = _mapping(state_dict, label="LINO checkpoint state_dict")
+    if not state_dict:
+        raise ValueError("LINO checkpoint state_dict must be non-empty")
+    entries: list[list[Any]] = []
+    for name, value in state_dict.items():
+        if not isinstance(name, str) or not isinstance(value, torch.Tensor):
+            raise ValueError("LINO checkpoint state_dict must contain named tensors")
+        entries.append([name, [int(dimension) for dimension in value.shape], str(value.dtype)])
+    return sha256_bytes(canonical_json_bytes(entries))
+
+
+def _validate_trained_export_sidecar(
+    config: SdmExrInferenceConfig,
+    checkpoint: Path,
+    checkpoint_bytes: bytes,
+    checkpoint_digest: str,
+    *,
+    selection_source_bytes: bytes,
+) -> dict[str, Any]:
+    """Validate the immutable sidecar paired with a private trained export.
+
+    The sidecar is intentionally checked before the model constructor is
+    reached.  This makes a wrong export/data contract fail without importing
+    or allocating the released model.
+    """
+
+    sidecar = checkpoint.with_suffix(".json")
+    try:
+        sidecar_identity_before = file_identity(sidecar, label="LINO checkpoint sidecar")
+        sidecar_bytes = read_file_bytes(sidecar, label="LINO checkpoint sidecar")
+        sidecar_identity = file_identity(sidecar, label="LINO checkpoint sidecar")
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "trained LINO checkpoint requires an adjacent regular JSON sidecar: "
+            f"{sidecar}"
+        ) from exc
+    if sidecar_identity != sidecar_identity_before:
+        raise ValueError("LINO checkpoint sidecar was replaced while reading its immutable snapshot")
+    if not sidecar_bytes:
+        raise ValueError("LINO checkpoint sidecar is empty")
+    sidecar_digest = sha256_bytes(sidecar_bytes)
+    try:
+        metadata = json.loads(sidecar_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("LINO checkpoint sidecar is not valid JSON") from exc
+    metadata = _mapping(metadata, label="LINO checkpoint sidecar")
+
+    if metadata.get("artifact_kind") != "lino_private_inference_weights":
+        raise ValueError("LINO checkpoint sidecar artifact_kind is invalid")
+    if metadata.get("checkpoint_sha256") != checkpoint_digest:
+        raise ValueError("LINO checkpoint sidecar checkpoint SHA-256 does not match checkpoint bytes")
+    architecture = _nonempty_text(
+        metadata.get("architecture_schema_sha256"),
+        label="LINO checkpoint sidecar architecture_schema_sha256",
+    )
+    if architecture != _checkpoint_schema_fingerprint(checkpoint_bytes):
+        raise ValueError("LINO checkpoint architecture schema fingerprint does not match sidecar")
+    preprocessing = metadata.get("preprocessing_version")
+    if preprocessing != config.preprocessing_version:
+        raise ValueError(
+            "LINO checkpoint sidecar preprocessing_version does not match inference config"
+        )
+    if metadata.get("run_kind") != "experiment" or metadata.get("comparable") is not True:
+        raise ValueError("trained LINO inference requires a comparable experiment export")
+
+    contract = _mapping(metadata.get("data_contract"), label="LINO sidecar data_contract")
+    if contract.get("artifact_kind") != "lino_private_training_contract":
+        raise ValueError("LINO sidecar data_contract artifact_kind is invalid")
+    if contract.get("run_kind") != "experiment" or contract.get("comparable") is not True:
+        raise ValueError("LINO sidecar data_contract is not a comparable experiment")
+    contract_architecture = _nonempty_text(
+        contract.get("architecture_schema_sha256"),
+        label="LINO sidecar data_contract architecture_schema_sha256",
+    )
+    if contract_architecture != architecture:
+        raise ValueError("LINO sidecar architecture schema fingerprint mismatch")
+    source_revision = _nonempty_text(
+        metadata.get("source_revision"),
+        label="LINO checkpoint sidecar source_revision",
+    )
+    snapshot = _mapping(contract.get("config_snapshot"), label="LINO sidecar config_snapshot")
+
+    expected_geometry = config.expected_source_geometry
+    if expected_geometry is None:
+        raise ValueError("trained LINO inference requires expected_source_geometry")
+    if _geometry_pair(snapshot.get("expected_source_geometry"), label="LINO sidecar source geometry") != expected_geometry:
+        raise ValueError("LINO sidecar source geometry does not match inference config")
+    expected_snapshot = {
+        "max_image_resolution": config.max_image_resolution,
+        "canonical_resolution": 256,
+        "mask_policy": "external",
+        "normal_encoding": "unsigned",
+        "external_mask_filename": config.external_mask_filename,
+        "mask_margin": config.mask_margin,
+        "pixel_samples": config.pixel_samples,
+        "preprocessing_version": config.preprocessing_version,
+    }
+    for field, expected in expected_snapshot.items():
+        if snapshot.get(field) != expected:
+            raise ValueError(f"LINO sidecar {field} does not match inference contract")
+    if snapshot.get("max_image_num") != 6 or snapshot.get("light_selection") != "seeded":
+        raise ValueError("LINO sidecar training light-selection contract is invalid")
+
+    final_selection_digest = _nonempty_text(
+        contract.get("final_selection_manifest_sha256"),
+        label="LINO sidecar final_selection_manifest_sha256",
+    )
+    if final_selection_digest != sha256_bytes(selection_source_bytes):
+        raise ValueError("LINO sidecar final selection manifest digest does not match manifest bytes")
+    return {
+        "path": str(sidecar.resolve(strict=True)),
+        "identity": sidecar_identity,
+        "sha256": sidecar_digest,
+        "architecture_schema_sha256": architecture,
+        "source_revision": source_revision,
+        "run_kind": str(metadata["run_kind"]),
+        "comparable": bool(metadata["comparable"]),
+    }
+
+
+def _validate_trained_selection_manifest(
+    config: SdmExrInferenceConfig,
+    manifest: DatasetManifest,
+) -> None:
+    """Require the final private comparison manifest's exact 16-light shape."""
+
+    if config.light_selection != "manifest" or config.max_image_num != 16:
+        raise ValueError("trained private inference requires manifest mode with exactly 16 lights")
+    expected_names = {record.name for record in manifest.objects}
+    if len(expected_names) != len(manifest.objects):
+        raise ValueError("trained private inference manifest contains duplicate objects")
+    for record in manifest.objects:
+        names = tuple(record.selected_images)
+        if len(names) != 16 or len(set(names)) != 16:
+            raise ValueError(
+                f"trained private inference requires exactly 16 unique selected images for {record.name}"
+            )
 
 
 def _resolve_device(config: SdmExrInferenceConfig) -> torch.device:
@@ -137,9 +313,10 @@ def load_local_lino_checkpoint(
         raise ValueError("LINO checkpoint must contain a state-dict mapping")
 
     # Match the author's released loaders in ``hubconf.py`` and
-    # ``LiNo_UniPS.from_pretrained``: published checkpoints are intentionally
-    # loaded non-strictly, without rejecting missing or unexpected keys.
-    model.load_state_dict(state_dict, strict=False)
+    # ``LiNo_UniPS.from_pretrained`` for the default route.  The paired private
+    # export route opts into strict loading only after its sidecar/data gate
+    # has been validated by ``run_lino_inference``.
+    model.load_state_dict(state_dict, strict=bool(config.require_checkpoint_data_contract))
 
     # Preserve checkpoint parameter storage precision.  Autocast in the
     # inference loop controls operation precision without a permanent cast.
@@ -692,6 +869,7 @@ def _run_lino_inference_pinned(
     config_file_path: Path | None,
     config_digest: str | None,
     selection_source_bytes: bytes | None,
+    trained_export: Mapping[str, Any] | None,
     clock: Callable[[], float],
     total_started: float,
 ) -> dict[str, Any]:
@@ -721,6 +899,8 @@ def _run_lino_inference_pinned(
         require_run=False,
     )
     _invalidate_lino_run(lino_fd)
+    if config.require_checkpoint_data_contract:
+        _validate_trained_selection_manifest(config, manifest)
     preflight_report = preflight_transfer_sources(config, manifest)
     if tuple(preflight_report) != tuple(record.name for record in manifest.objects):
         raise ValueError("preflight object order does not match the manifest")
@@ -977,7 +1157,22 @@ def _run_lino_inference_pinned(
         "checkpoint_sha256": checkpoint_digest,
         "checkpoint_path": str(checkpoint.resolve(strict=True)),
         "checkpoint_identity": checkpoint_identity,
+        "checkpoint_sidecar_path": (
+            trained_export["path"] if trained_export is not None else None
+        ),
+        "checkpoint_sidecar_sha256": (
+            trained_export["sha256"] if trained_export is not None else None
+        ),
         "preprocessing": lino_preprocessing_snapshot(config),
+        "preprocessing_version": config.preprocessing_version,
+        "require_checkpoint_data_contract": config.require_checkpoint_data_contract,
+        "selected_light_count": int(config.max_image_num),
+        "run_kind": (
+            trained_export["run_kind"] if trained_export is not None else "released_transfer"
+        ),
+        "comparable": (
+            bool(trained_export["comparable"]) if trained_export is not None else False
+        ),
         "repository_commit": _repository_commit(repo_root),
         "mask_policy": config.mask_policy,
         "normal_encoding": config.normal_encoding,
@@ -1079,10 +1274,6 @@ def run_lino_inference(
         if not config.save_exr:
             raise ValueError("save_exr must be true for authoritative LINO output")
 
-        device = _resolve_device(config)
-        dtype = _precision_dtype(config)
-        if model_loader is None and device.type != "cuda":
-            raise RuntimeError("released LINO checkpoint inference requires CUDA bf16")
         checkpoint = Path(config.checkpoint)
         if not checkpoint.is_file():
             raise FileNotFoundError(f"LINO checkpoint does not exist: {checkpoint}")
@@ -1106,6 +1297,23 @@ def run_lino_inference(
                 config.effective_selection_manifest_path,
                 label="selection manifest",
             )
+        trained_export: Mapping[str, Any] | None = None
+        if config.require_checkpoint_data_contract:
+            if selection_source_bytes is None:
+                raise ValueError(
+                    "trained private inference requires an immutable selection manifest snapshot"
+                )
+            trained_export = _validate_trained_export_sidecar(
+                config,
+                checkpoint,
+                checkpoint_bytes,
+                checkpoint_digest,
+                selection_source_bytes=selection_source_bytes,
+            )
+        device = _resolve_device(config)
+        dtype = _precision_dtype(config)
+        if model_loader is None and device.type != "cuda":
+            raise RuntimeError("released LINO checkpoint inference requires CUDA bf16")
         print(f"Exploring {config.data_root}")
         manifest = build_dataset_manifest(
             config,
@@ -1128,6 +1336,7 @@ def run_lino_inference(
             config_file_path=config_file_path,
             config_digest=config_digest,
             selection_source_bytes=selection_source_bytes,
+            trained_export=trained_export,
             clock=clock,
             total_started=total_started,
         )

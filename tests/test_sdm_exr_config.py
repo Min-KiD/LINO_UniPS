@@ -68,6 +68,7 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertEqual(config.normal_filenames, ("local_normal.exr",))
         self.assertIsNone(config.selection_manifest)
         self.assertEqual(config.preprocessing_version, "released_transfer_v1")
+        self.assertFalse(config.require_checkpoint_data_contract)
         self.assertEqual(config.policy_root, config.output_root / "external")
         self.assertEqual(config.lino_output_dir, config.policy_root / "lino")
         self.assertEqual(config.sdm_view_dir, config.policy_root / "sdm_input")
@@ -169,6 +170,21 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertEqual(config.expected_source_geometry, (256, 256))
         self.assertEqual(config.max_image_num, 16)
 
+    def test_trained_private_inference_preset_enables_strict_paired_contract(self):
+        from src.comparison.config import load_sdm_exr_config
+
+        repo_root = Path(__file__).resolve().parents[1]
+        config = load_sdm_exr_config(
+            repo_root / "configs/lino_private_infer_trained_fixed.yaml"
+        )
+        self.assertEqual(config.preprocessing_version, "private_external_lino_native_v1")
+        self.assertTrue(config.require_checkpoint_data_contract)
+        self.assertEqual(config.light_selection, "manifest")
+        self.assertEqual(config.max_image_num, 16)
+        self.assertEqual(config.expected_source_geometry, (256, 256))
+        self.assertEqual(config.max_image_resolution, 512)
+        self.assertEqual(config.normal_encoding, "unsigned")
+
     def test_external_and_full_are_the_only_mask_policies(self):
         external = self.load(mask_policy="external")
         full = self.load(mask_policy="full")
@@ -243,10 +259,22 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertIsNone(load_sdm_exr_config(path).expected_source_geometry)
 
     def test_preprocessing_version_is_optional_and_supports_private_native_v1(self):
+        with self.assertRaisesRegex(ValueError, "require_checkpoint_data_contract"):
+            self.load(preprocessing_version="private_external_lino_native_v1")
+        trained = self.load(
+            preprocessing_version="private_external_lino_native_v1",
+            require_checkpoint_data_contract=True,
+            light_selection="manifest",
+            selection_manifest=str(self.root / "selected.json"),
+            expected_source_geometry=[256, 256],
+            normal_encoding="unsigned",
+            max_image_resolution=512,
+        )
         self.assertEqual(
-            self.load(preprocessing_version="private_external_lino_native_v1").preprocessing_version,
+            trained.preprocessing_version,
             "private_external_lino_native_v1",
         )
+        self.assertTrue(trained.require_checkpoint_data_contract)
         values = self.complete_values()
         values.pop("expected_source_geometry")
         path = self.root / "older-config-without-version.yaml"
