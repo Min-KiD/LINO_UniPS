@@ -1,0 +1,27 @@
+# Manifest-pinned companion for the successful private LINO transfer run.
+# This is inference-only; it does not train LINO or modify the released model.
+
+checkpoint: "./checkpoints/lino.pth"
+data_root: "/mnt/18TData/minhnv/inference"
+output_root: "./output/lino_private_transfer_fixed"
+object_suffix: ".data"
+image_prefix: "image"
+image_extension: ".exr"
+max_image_num: 16
+light_selection: "manifest"
+selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"
+seed: 20260710
+mask_policy: "external"
+external_mask_filename: "binary_mask.exr"
+normal_filenames:
+  - "local_normal.exr"
+normal_encoding: "unsigned"
+expected_source_geometry: [256, 256]
+mask_margin: 8
+max_image_resolution: 512
+pixel_samples: 2048
+precision: "bf16"
+device: "cuda"
+num_workers: 0
+save_exr: true
+save_png: false

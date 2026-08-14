@@ -232,7 +232,36 @@ Interpret the transfer results with this decision table:
 
 No numeric pass threshold is imposed for this private HDR distribution.
 
-### Where `run.json` is created
+### Manifest-pinned companion for corrected SDM pairing
+
+The released-checkpoint LINO external result (`17.6228` MAE) remains valid.
+For a reproducible pairing with corrected SDM inference, rerun LINO with:
+
+```bash
+python eval.py --config configs/lino_private_transfer_fixed.yaml
+```
+
+This companion does not train LINO and is not a model fix. It changes only the
+output root and replaces seeded selection with the exact ordered light list
+already written by the successful transfer run:
+
+```text
+/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json
+```
+
+The completion record is written only after all objects finish:
+
+```text
+output/lino_private_transfer_fixed/external/lino/run.json
+```
+
+Corrected SDM inference consumes the same manifest, so both methods see the
+same sixteen observations in the same order. This remains a comparison of a
+private-trained SDM checkpoint against zero-shot released LINO weights; final
+architecture fairness requires training LINO on the same private split and
+protocol.
+
+## Where `run.json` is created
 
 LINO writes this file only after every object finishes successfully:
 

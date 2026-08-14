@@ -147,6 +147,27 @@ class SdmExrConfigTests(unittest.TestCase):
             Path("output/lino_private_transfer/external/lino"),
         )
 
+    def test_fixed_private_transfer_preset_pins_shared_light_manifest(self):
+        from src.comparison.config import load_sdm_exr_config
+
+        repo_root = Path(__file__).resolve().parents[1]
+        config = load_sdm_exr_config(
+            repo_root / "configs/lino_private_transfer_fixed.yaml"
+        )
+        self.assertEqual(config.output_root, Path("./output/lino_private_transfer_fixed"))
+        self.assertEqual(config.light_selection, "manifest")
+        self.assertEqual(
+            config.selection_manifest,
+            Path(
+                "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/"
+                "external/selected_lights.json"
+            ),
+        )
+        self.assertEqual(config.normal_encoding, "unsigned")
+        self.assertEqual(config.mask_policy, "external")
+        self.assertEqual(config.expected_source_geometry, (256, 256))
+        self.assertEqual(config.max_image_num, 16)
+
     def test_external_and_full_are_the_only_mask_policies(self):
         external = self.load(mask_policy="external")
         full = self.load(mask_policy="full")
