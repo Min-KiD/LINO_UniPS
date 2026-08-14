@@ -503,6 +503,34 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
                 iterator._shutdown_workers()
             del loader
 
+    def test_spawn_persistent_workers_observe_epoch_updates(self):
+        config, manifest = self.manifest()
+        dataset = PrivateExrTrainDataset(config, manifest, split="train")
+        with mock.patch.dict(os.environ, {"MKL_THREADING_LAYER": "GNU"}, clear=False):
+            loader = DataLoader(
+                dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=1,
+                persistent_workers=True,
+                prefetch_factor=1,
+                multiprocessing_context="spawn",
+                collate_fn=_metadata_only_collate,
+            )
+            try:
+                dataset.set_epoch(0)
+                first = next(iter(loader))
+                dataset.set_epoch(1)
+                second = next(iter(loader))
+                self.assertEqual(first["epoch"], 0)
+                self.assertEqual(second["epoch"], 1)
+                self.assertNotEqual(first["selected_images"], second["selected_images"])
+            finally:
+                iterator = getattr(loader, "_iterator", None)
+                if iterator is not None:
+                    iterator._shutdown_workers()
+                del loader
+
     def test_source_and_target_masks_remain_separate(self):
         config, manifest = self.manifest()
         sample = PrivateExrTrainDataset(config, manifest, split="train")[0]

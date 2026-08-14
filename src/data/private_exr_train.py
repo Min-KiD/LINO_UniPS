@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from multiprocessing import Value
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -128,7 +127,7 @@ class PrivateExrTrainDataset(Dataset):
         self.config = config
         self.manifest = manifest
         self.split = split
-        self._epoch_state = Value("q", 0, lock=True)
+        self._epoch_state = torch.zeros((), dtype=torch.int64).share_memory_()
         self._data_root = config_root
         self.records = manifest.objects
         for record in self.records:
@@ -189,8 +188,7 @@ class PrivateExrTrainDataset(Dataset):
 
     @property
     def epoch(self) -> int:
-        with self._epoch_state.get_lock():
-            return int(self._epoch_state.value)
+        return int(self._epoch_state.item())
 
     def _selected_names(self, record: PrivateObjectRecord) -> tuple[str, ...]:
         return select_observation_names(
@@ -208,8 +206,7 @@ class PrivateExrTrainDataset(Dataset):
     def set_epoch(self, epoch: int) -> None:
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ValueError("epoch must be a non-negative integer")
-        with self._epoch_state.get_lock():
-            self._epoch_state.value = epoch
+        self._epoch_state.fill_(epoch)
 
     def __len__(self) -> int:
         return len(self.records)
