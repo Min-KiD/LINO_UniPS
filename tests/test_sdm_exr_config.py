@@ -67,6 +67,7 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertIsInstance(config.output_root, Path)
         self.assertEqual(config.normal_filenames, ("local_normal.exr",))
         self.assertIsNone(config.selection_manifest)
+        self.assertEqual(config.preprocessing_version, "released_transfer_v1")
         self.assertEqual(config.policy_root, config.output_root / "external")
         self.assertEqual(config.lino_output_dir, config.policy_root / "lino")
         self.assertEqual(config.sdm_view_dir, config.policy_root / "sdm_input")
@@ -203,6 +204,7 @@ class SdmExrConfigTests(unittest.TestCase):
     def test_validation_rejects_unsupported_values_and_nonpositive_counts(self):
         cases = (
             ("normal_encoding", "octahedral"),
+            ("preprocessing_version", "unknown_v1"),
             ("light_selection", "random"),
             ("precision", "fp8"),
             ("device", "tpu"),
@@ -239,6 +241,22 @@ class SdmExrConfigTests(unittest.TestCase):
         path = self.root / "older-config.yaml"
         path.write_text(yaml.safe_dump(values, sort_keys=False), encoding="utf-8")
         self.assertIsNone(load_sdm_exr_config(path).expected_source_geometry)
+
+    def test_preprocessing_version_is_optional_and_supports_private_native_v1(self):
+        self.assertEqual(
+            self.load(preprocessing_version="private_external_lino_native_v1").preprocessing_version,
+            "private_external_lino_native_v1",
+        )
+        values = self.complete_values()
+        values.pop("expected_source_geometry")
+        path = self.root / "older-config-without-version.yaml"
+        path.write_text(yaml.safe_dump(values, sort_keys=False), encoding="utf-8")
+        from src.comparison.config import load_sdm_exr_config
+
+        self.assertEqual(
+            load_sdm_exr_config(path).preprocessing_version,
+            "released_transfer_v1",
+        )
 
     def test_nonempty_string_fields_and_normal_filenames_are_required(self):
         for key in ("object_suffix", "image_prefix", "image_extension", "external_mask_filename"):

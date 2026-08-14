@@ -40,7 +40,9 @@ _CONFIG_FIELDS = frozenset(
         "save_png",
     }
 )
-_OPTIONAL_CONFIG_FIELDS = frozenset({"expected_source_geometry"})
+_OPTIONAL_CONFIG_FIELDS = frozenset(
+    {"expected_source_geometry", "preprocessing_version"}
+)
 
 
 def _require_text(value: Any, field_name: str) -> str:
@@ -90,6 +92,7 @@ class SdmExrInferenceConfig:
     save_exr: bool
     save_png: bool
     expected_source_geometry: tuple[int, int] | None = None
+    preprocessing_version: str = "released_transfer_v1"
 
     def __post_init__(self) -> None:
         for name in ("checkpoint", "data_root", "output_root"):
@@ -113,6 +116,14 @@ class SdmExrInferenceConfig:
             raise ValueError("mask_policy must be one of: external, full")
         if self.normal_encoding not in {"signed", "unsigned"}:
             raise ValueError("normal_encoding must be one of: signed, unsigned")
+        if self.preprocessing_version not in {
+            "released_transfer_v1",
+            "private_external_lino_native_v1",
+        }:
+            raise ValueError(
+                "preprocessing_version must be one of: "
+                "released_transfer_v1, private_external_lino_native_v1"
+            )
         if self.expected_source_geometry is not None:
             if (
                 not isinstance(self.expected_source_geometry, tuple)
@@ -276,6 +287,10 @@ def load_sdm_exr_config(path: str | Path) -> SdmExrInferenceConfig:
         normal_filenames=_as_normal_filenames(raw["normal_filenames"]),
         normal_encoding=_require_text(raw["normal_encoding"], "normal_encoding"),
         expected_source_geometry=_as_optional_geometry(raw.get("expected_source_geometry")),
+        preprocessing_version=_require_text(
+            raw.get("preprocessing_version", "released_transfer_v1"),
+            "preprocessing_version",
+        ),
         mask_margin=_require_int(raw["mask_margin"], "mask_margin"),
         max_image_resolution=_require_int(
             raw["max_image_resolution"], "max_image_resolution"

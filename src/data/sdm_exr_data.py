@@ -11,7 +11,6 @@ from collections.abc import Mapping
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
-import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -22,9 +21,14 @@ from src.comparison.exr_io import (
     read_mask_exr_bytes,
     read_rgb_exr_bytes,
 )
-from src.comparison.manifest import DatasetManifest, ObjectRecord, stable_seed
+from src.comparison.manifest import DatasetManifest, ObjectRecord
 from src.comparison.provenance import sha256_bytes
 from .data_module import get_roi
+from .lino_native_preprocessing import (
+    _normalization_seed,
+    normalize_lino_observations,
+    prepare_lino_native_geometry,
+)
 
 
 _SAMPLE_FIELDS = frozenset({"imgs", "mask", "mask_original", "roi", "metadata"})
@@ -252,16 +256,15 @@ class SdmExrDataset(Dataset):
             source_mask = np.ones((h0, w0), dtype=np.float32)
             mask_source, mask_digest = "full", None
 
-        # get_roi is the released loader's crop policy.  Passing the configured
-        # margin explicitly avoids relying on its default and keeps external and
-        # full masks on the same native geometry path.
-        roi = np.asarray(get_roi(source_mask, margin=int(self.config.mask_margin)), dtype=np.int64)
-        if roi.shape != (6,):
-            raise ValueError(f"ROI geometry is invalid for {record.name}: {roi!r}")
-        _, _, row_start, row_end, col_start, col_end = (int(value) for value in roi)
+        # Preserve the released target-size policy while sharing its crop and
+        # paired transforms with private LINO preprocessing.  A private-native
+        # config is fixed to one 512-pixel model tile by the shared helper.
+        roi_probe = np.asarray(get_roi(source_mask, margin=int(self.config.mask_margin)))
+        if roi_probe.shape != (6,):
+            raise ValueError(f"ROI geometry is invalid for {record.name}: {roi_probe!r}")
+        _, _, row_start, row_end, col_start, col_end = (int(value) for value in roi_probe)
         if not (0 <= row_start < row_end <= h0 and 0 <= col_start < col_end <= w0):
-            raise ValueError(f"ROI geometry is invalid for {record.name}: {roi.tolist()}")
-
+            raise ValueError(f"ROI geometry is invalid for {record.name}: {roi_probe.tolist()}")
         cropped_height = row_end - row_start
         cropped_width = col_end - col_start
         long_side = max(cropped_height, cropped_width)
@@ -274,34 +277,22 @@ class SdmExrDataset(Dataset):
         )
         if target <= 0 or target % 512:
             raise ValueError(f"resized geometry is invalid for {record.name}: {target}")
-
-        resized_images = [
-            np.asarray(
-                cv2.resize(
-                    image[row_start:row_end, col_start:col_end, :],
-                    (target, target),
-                    interpolation=cv2.INTER_CUBIC,
-                ),
-                dtype=np.float32,
-            )
-            for image in images
-        ]
-        # N,H,W,3 is convenient while loading; transpose to H,W,3,N before
-        # normalization so foreground indexing remains straightforward.
-        image_stack = np.stack(resized_images, axis=-1)
-        cropped_mask = source_mask[row_start:row_end, col_start:col_end]
-        resized_mask = np.asarray(
-            cv2.resize(cropped_mask, (target, target), interpolation=cv2.INTER_NEAREST) > 0.5,
-            dtype=np.float32,
+        geometry = prepare_lino_native_geometry(
+            np.stack(images, axis=-1),
+            source_mask,
+            margin=int(self.config.mask_margin),
+            target_resolution=target,
+            object_name=record.name,
+            preprocessing_version=self.config.preprocessing_version,
         )
-        resized_mask = _as_binary_mask(resized_mask, object_name=record.name)
-        if not np.isfinite(image_stack).all():
-            raise ValueError(f"selected images contain non-finite values for {record.name}")
+        image_stack = geometry.images
+        resized_mask = _as_binary_mask(geometry.model_mask, object_name=record.name)
+        roi = geometry.roi
 
         return {
             "images": np.ascontiguousarray(image_stack, dtype=np.float32),
             "mask": resized_mask,
-            "source_mask": source_mask,
+            "source_mask": geometry.source_model_mask,
             "roi": roi,
             "selected_images": tuple(record.selected_images),
             "selected_paths": tuple(selected_paths),
@@ -318,31 +309,18 @@ class SdmExrDataset(Dataset):
         mask: np.ndarray,
         record: ObjectRecord,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Apply deterministic released-style mean-to-maximum normalization."""
+        """Apply the selected version's deterministic normalization."""
 
-        image_array = np.asarray(images, dtype=np.float32)
-        mask_array = _as_binary_mask(mask, object_name=record.name)
-        support = mask_array > 0
-        foreground = image_array[support]
-        if foreground.size == 0:
-            raise ValueError(f"model support is empty for {record.name}")
-        # Foreground mean-RGB intensity per pixel, then spatial mean/max per
-        # light.  The mask here is the policy-specific resized model mask.
-        intensity = np.mean(foreground, axis=1, dtype=np.float64)
-        spatial_mean = np.mean(intensity, axis=0, dtype=np.float64)
-        spatial_max = np.max(intensity, axis=0)
-        light_count = image_array.shape[-1]
-        alpha = np.random.default_rng(
-            stable_seed(self.config.seed, record.name, "lino_normalization")
-        ).random(light_count)
-        scales = (1.0 - alpha) * spatial_mean + alpha * spatial_max
-        if not np.isfinite(scales).all() or np.any(scales <= 0):
-            raise ValueError(f"normalization scales must be finite and positive for {record.name}")
-        normalized = image_array / (scales.reshape(1, 1, 1, light_count) + 1.0e-6)
-        normalized = np.asarray(normalized, dtype=np.float32)
-        if not np.isfinite(normalized).all():
-            raise ValueError(f"normalized images contain non-finite values for {record.name}")
-        return normalized, np.asarray(alpha, dtype=np.float64), np.asarray(scales, dtype=np.float64)
+        normalized = normalize_lino_observations(
+            images,
+            mask,
+            base_seed=self.config.seed,
+            split="test",
+            epoch=0,
+            object_name=record.name,
+            version=self.config.preprocessing_version,
+        )
+        return normalized.images, normalized.alpha, normalized.scales
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
@@ -371,8 +349,15 @@ class SdmExrDataset(Dataset):
             "normalization_scales": scale_values,
             "seed": int(self.config.seed),
             "normalization_seed": int(
-                stable_seed(self.config.seed, record.name, "lino_normalization")
+                _normalization_seed(
+                    self.config.seed,
+                    "test",
+                    0,
+                    record.name,
+                    self.config.preprocessing_version,
+                )
             ),
+            "preprocessing_version": self.config.preprocessing_version,
         }
         sample: dict[str, Any] = {
             "imgs": torch.from_numpy(normalized.transpose(2, 0, 1, 3).copy()),

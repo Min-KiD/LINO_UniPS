@@ -11,10 +11,17 @@ from unittest import mock
 
 import numpy as np
 import torch
+import cv2
 
 from src.comparison.config import SdmExrInferenceConfig
-from src.comparison.exr_io import sha256_file
-from src.comparison.manifest import DatasetManifest, ObjectRecord, build_dataset_manifest
+from src.comparison.exr_io import read_mask_exr, read_rgb_exr, sha256_file
+from src.comparison.manifest import (
+    DatasetManifest,
+    ObjectRecord,
+    build_dataset_manifest,
+    stable_seed as legacy_manifest_seed,
+)
+from src.data.data_module import get_roi
 from src.data.sdm_exr_data import SdmExrDataset, collate_single_sdm_exr
 from tests.comparison_helpers import make_object, write_mask_exr, write_rgb_exr
 
@@ -299,6 +306,59 @@ class SdmExrDatasetTests(unittest.TestCase):
 
         torch.testing.assert_close(first["imgs"], second["imgs"])
         self.assertEqual(first["metadata"], second["metadata"])
+
+    def test_legacy_dataset_without_version_matches_released_transfer_formula(self):
+        object_dir = make_object(self.data_root, "alpha.data")
+        config, manifest = self.manifest(max_image_resolution=1024, mask_margin=0)
+        dataset = SdmExrDataset(config, manifest)
+        sample = dataset[0]
+        record = manifest.objects[0]
+
+        source_images = [read_rgb_exr(object_dir / name) for name in record.selected_images]
+        source_mask = read_mask_exr(object_dir / "binary_mask.exr")
+        roi = np.asarray(get_roi(source_mask, margin=0), dtype=np.int64)
+        _, _, row_start, row_end, col_start, col_end = map(int, roi)
+        cropped_height = row_end - row_start
+        cropped_width = col_end - col_start
+        target = max(512, min(1024, (max(cropped_height, cropped_width) // 512) * 512))
+        expected_images = np.stack(
+            [
+                cv2.resize(
+                    image[row_start:row_end, col_start:col_end, :],
+                    (target, target),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+                for image in source_images
+            ],
+            axis=-1,
+        ).astype(np.float32)
+        expected_mask = np.asarray(
+            cv2.resize(
+                source_mask[row_start:row_end, col_start:col_end],
+                (target, target),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            > 0.5,
+            dtype=np.float32,
+        )
+        foreground = expected_images[expected_mask > 0]
+        intensity = np.mean(foreground, axis=1, dtype=np.float64)
+        spatial_mean = np.mean(intensity, axis=0, dtype=np.float64)
+        spatial_max = np.max(intensity, axis=0)
+        alpha = np.random.default_rng(
+            legacy_manifest_seed(config.seed, record.name, "lino_normalization")
+        ).random(expected_images.shape[-1])
+        scales = (1.0 - alpha) * spatial_mean + alpha * spatial_max
+        expected_images = expected_images / (
+            scales.reshape(1, 1, 1, expected_images.shape[-1]) + 1.0e-6
+        )
+
+        np.testing.assert_allclose(sample["imgs"].numpy(), expected_images.transpose(2, 0, 1, 3))
+        np.testing.assert_array_equal(sample["mask"].numpy()[0], expected_mask)
+        np.testing.assert_array_equal(sample["mask_original"].numpy()[0], source_mask)
+        np.testing.assert_array_equal(sample["roi"].numpy(), roi)
+        np.testing.assert_allclose(sample["metadata"]["normalization_alpha"], alpha)
+        np.testing.assert_allclose(sample["metadata"]["normalization_scales"], scales)
 
     def test_external_and_full_use_their_own_native_normalization_support(self):
         object_dir = make_object(self.data_root, "alpha.data")
