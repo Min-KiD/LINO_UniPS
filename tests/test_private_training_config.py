@@ -8,7 +8,11 @@ from pathlib import Path
 
 import yaml
 
-from src.training.config import load_private_train_config, resolved_config_dict
+from src.training.config import (
+    PrivateTrainConfig,
+    load_private_train_config,
+    resolved_config_dict,
+)
 
 
 class PrivateTrainingConfigTests(unittest.TestCase):
@@ -66,12 +70,94 @@ class PrivateTrainingConfigTests(unittest.TestCase):
 
     def test_cold_start_contract_is_exact(self):
         config = load_private_train_config(self._write_yaml(self.valid_mapping()))
-        self.assertEqual(config.startup_mode, "cold_start")
-        self.assertEqual(config.train_dir, Path("/mnt/18TData/minhnv/train"))
-        self.assertEqual(config.expected_source_geometry, (256, 256))
-        self.assertEqual(config.max_image_resolution, 512)
-        self.assertEqual(config.preprocessing_version, "private_external_lino_native_v1")
-        self.assertEqual(config.adamw_betas, (0.9, 0.98))
+        expected = PrivateTrainConfig(
+            train_dir=Path("/mnt/18TData/minhnv/train"),
+            test_dir=Path("/mnt/18TData/minhnv/test"),
+            save_dir=Path("/mnt/18TData/minhnv/runs/lino_private"),
+            startup_mode="cold_start",
+            init_checkpoint=None,
+            resume_checkpoint=None,
+            final_selection_manifest=Path(
+                "/mnt/18TData/minhnv/runs/lino_private/selection.json"
+            ),
+            object_suffix=".data",
+            image_prefix="image",
+            image_extension=".exr",
+            normal_filenames=("local_normal.exr",),
+            external_mask_filename="binary_mask.exr",
+            normal_encoding="unsigned",
+            expected_source_geometry=(256, 256),
+            mask_policy="external",
+            mask_margin=8,
+            max_image_num=6,
+            light_selection="seeded",
+            seed=20260710,
+            preprocessing_version="private_external_lino_native_v1",
+            max_image_resolution=512,
+            canonical_resolution=256,
+            pixel_samples=2048,
+            train_pixel_budget=131072,
+            precision="bf16",
+            device="cuda",
+            deterministic=True,
+            epochs=50,
+            train_batch_size=2,
+            train_workers=4,
+            test_workers=2,
+            learning_rate=0.0001,
+            weight_decay=0.01,
+            adamw_betas=(0.9, 0.98),
+            scheduler_step_size=10,
+            scheduler_gamma=0.5,
+            save_every_epochs=5,
+            keep_milestone_epochs=(10, 25, 50),
+        )
+        self.assertEqual(config, expected)
+        self.assertEqual(
+            resolved_config_dict(config),
+            {
+                "train_dir": "/mnt/18TData/minhnv/train",
+                "test_dir": "/mnt/18TData/minhnv/test",
+                "save_dir": "/mnt/18TData/minhnv/runs/lino_private",
+                "startup_mode": "cold_start",
+                "init_checkpoint": None,
+                "resume_checkpoint": None,
+                "final_selection_manifest": (
+                    "/mnt/18TData/minhnv/runs/lino_private/selection.json"
+                ),
+                "object_suffix": ".data",
+                "image_prefix": "image",
+                "image_extension": ".exr",
+                "normal_filenames": ["local_normal.exr"],
+                "external_mask_filename": "binary_mask.exr",
+                "normal_encoding": "unsigned",
+                "expected_source_geometry": [256, 256],
+                "mask_policy": "external",
+                "mask_margin": 8,
+                "max_image_num": 6,
+                "light_selection": "seeded",
+                "seed": 20260710,
+                "preprocessing_version": "private_external_lino_native_v1",
+                "max_image_resolution": 512,
+                "canonical_resolution": 256,
+                "pixel_samples": 2048,
+                "train_pixel_budget": 131072,
+                "precision": "bf16",
+                "device": "cuda",
+                "deterministic": True,
+                "epochs": 50,
+                "train_batch_size": 2,
+                "train_workers": 4,
+                "test_workers": 2,
+                "learning_rate": 0.0001,
+                "weight_decay": 0.01,
+                "adamw_betas": [0.9, 0.98],
+                "scheduler_step_size": 10,
+                "scheduler_gamma": 0.5,
+                "save_every_epochs": 5,
+                "keep_milestone_epochs": [10, 25, 50],
+            },
+        )
 
     def test_loader_converts_paths_and_sequences(self):
         config = load_private_train_config(self._write_yaml(self.valid_mapping()))
@@ -134,6 +220,14 @@ class PrivateTrainingConfigTests(unittest.TestCase):
         raw["startup_mode"] = "resume"
         raw["resume_checkpoint"] = "runs/lino_epoch_040.pth"
         with self.assertRaisesRegex(ValueError, "resume_checkpoint.*ckpt"):
+            load_private_train_config(self._write_yaml(raw))
+
+    def test_resume_excludes_init_checkpoint(self):
+        raw = self.valid_mapping()
+        raw["startup_mode"] = "resume"
+        raw["init_checkpoint"] = "checkpoints/lino.pth"
+        raw["resume_checkpoint"] = "runs/lino_epoch_040.ckpt"
+        with self.assertRaisesRegex(ValueError, "resume.*init_checkpoint"):
             load_private_train_config(self._write_yaml(raw))
 
     def test_train_and_test_roots_cannot_alias(self):
