@@ -4,11 +4,209 @@ This guide covers only the new SDM-style EXR workflow on the
 `dev-lino-sdm-comparison` branch. It starts with environment installation and
 ends with paired LINO/SDM angular-error results.
 
-## Training
+## Released-checkpoint comparison (inference only)
 
 There is no training command in this comparison workflow. It uses released
 LINO-UniPS and SDM-UniPS checkpoints and does not retrain or change either
-model architecture.
+model architecture. The separate private-training workflow is documented
+below so that this heading does not imply that LINO training is unsupported.
+
+## Private LINO training on corrected EXR data
+
+This workflow trains the exact released `LiNo_UniPS` normal graph on the
+private `.data` objects used by the corrected SDM comparison. It keeps the
+source observations at 256x256, uses LINO's native 512x512 internal path, and
+does not modify the released model parameter names or the original synthetic
+training entry point. The primary experiment is a cold start for 100 total
+epochs; no official accuracy result exists until that run and its paired
+inference have actually completed.
+
+### Install and verify the training inputs
+
+Run these commands from the LINO checkout. Use the LINO environment, not the
+SDM environment:
+
+```bash
+cd /mnt/16TData/minhnv/LINO
+conda activate LINO
+python -m pip install -r requirements.txt
+
+test -d /mnt/18TData/minhnv/train
+test -d /mnt/18TData/minhnv/test
+test -d /mnt/18TData/minhnv/inference
+test -f /mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json
+```
+
+The training preset expects each train/test object to contain finite
+`image*.exr` observations, `local_normal.exr`, and an independently generated
+`binary_mask.exr`, all at 256x256. The final-selection manifest is used only
+to bind the later 16-light comparison; it must exist before training starts.
+
+### Cold-start training
+
+The checked-in preset is the primary run:
+
+```bash
+python train_private.py --config configs/lino_private_train_fixed.yaml
+```
+
+It uses six seeded lights for training, the explicit train/test roots, BF16
+CUDA, AdamW, StepLR, and 100 total epochs. The command prints one line after
+each successfully published epoch. Do not treat a stopped or failed run as a
+completed experiment; the last valid `last.ckpt` remains the resume point.
+
+### Resume from a full training checkpoint
+
+`.ckpt` is the only artifact that resumes optimizer, scheduler, epoch, best
+metric, and RNG state. A resume target is the total epoch count, not the number
+of additional epochs. Copy the preset and change only the startup paths and
+the total target:
+
+```bash
+cp configs/lino_private_train_fixed.yaml /tmp/lino_private_train_resume.yaml
+```
+
+Set these values in `/tmp/lino_private_train_resume.yaml`:
+
+```yaml
+startup_mode: "resume"
+init_checkpoint: null
+resume_checkpoint: "./runs/lino_private_fixed_bf16/checkpoints/last.ckpt"
+epochs: 100
+```
+
+Then run:
+
+```bash
+python train_private.py --config /tmp/lino_private_train_resume.yaml
+```
+
+For example, a checkpoint completed through epoch 40 with `epochs: 100`
+continues at epoch 41. Compatibility fingerprints reject changes to the
+architecture, data contract, preprocessing, light schedule, objective,
+optimizer, or scheduler. Increasing the total epoch target is allowed.
+
+### Initialize from a model-only `.pth`
+
+Initialization is a separate experiment. It loads model weights only and
+resets optimizer, scheduler, epoch, best metrics, and RNG state; it is not a
+resume. Copy the preset and set:
+
+```bash
+cp configs/lino_private_train_fixed.yaml /tmp/lino_private_train_init.yaml
+```
+
+Then edit `/tmp/lino_private_train_init.yaml` with:
+
+```yaml
+startup_mode: "init_checkpoint"
+init_checkpoint: "./checkpoints/lino.pth"
+resume_checkpoint: null
+save_dir: "./runs/lino_private_init"
+epochs: 100
+```
+
+Then run it with an intentionally separate `save_dir`:
+
+```bash
+python train_private.py --config /tmp/lino_private_train_init.yaml
+```
+
+The released checkpoint route permits only the four documented author-extra
+keys. Any missing current key, unexpected key, or shape/dtype mismatch fails
+before the live model or CUDA device is created.
+
+### Artifacts and selection policy
+
+The primary run writes under `runs/lino_private_fixed_bf16/`:
+
+```text
+config.resolved.yaml       # resolved training settings
+data_contract.json         # data, architecture, and comparison contract
+metrics.csv                # one row per successfully published epoch
+checkpoints/last.ckpt      # latest complete resume state
+checkpoints/best_validation.ckpt
+checkpoints/lino_epoch_100.ckpt
+exports/lino_epoch_100.pth # raw model-only inference weights
+exports/lino_epoch_100.json
+```
+
+The adjacent export JSON is mandatory for strict trained-checkpoint
+inference. The raw `.pth` contains only detached CPU tensors from the released
+model; it has no `net.` or `model.` wrapper prefix and cannot resume training.
+Epoch 100 is the primary comparison checkpoint. `best_validation` is a
+secondary diagnostic and must not silently replace epoch 100 in the final
+comparison. The training command does not produce a final comparison MAE;
+that number is available only after successful inference on the final data.
+
+### Strict inference of the epoch-100 export
+
+After the 100-epoch run succeeds, use the paired preset:
+
+```bash
+python eval.py --config configs/lino_private_infer_trained_fixed.yaml
+```
+
+This validates the adjacent JSON sidecar, its checkpoint digest, architecture
+schema, preprocessing version, 256x256 source geometry, external-mask and
+unsigned-normal contract, and the exact 16-light manifest before constructing
+the model. It writes signed 256x256 predictions under
+`output/lino_private_trained_fixed/external/lino/` and prints elapsed time,
+MAE, and CUDA memory. `run.json` is created only after every selected object
+finishes successfully; a missing `run.json` means the inference run is partial
+or failed. Do not create it manually.
+
+### Short manual GPU smoke gate (non-comparable)
+
+Before committing to the full run, use an isolated one-epoch smoke config. It
+uses the same code path but limits the run to the first two manifest-ordered
+objects and writes below a separate `save_dir/smoke` directory:
+
+```bash
+cp configs/lino_private_train_fixed.yaml /tmp/lino_private_smoke.yaml
+sed -i \
+  -e 's#save_dir: "./runs/lino_private_fixed_bf16"#save_dir: "./runs/lino_private_smoke"#' \
+  -e 's/epochs: 100/epochs: 1/' \
+  /tmp/lino_private_smoke.yaml
+python train_private.py --config /tmp/lino_private_smoke.yaml --smoke
+```
+
+Verify finite metrics, `runs/lino_private_smoke/smoke/checkpoints/last.ckpt`,
+and the raw export plus adjacent JSON. Then test epoch-boundary resume:
+
+```bash
+cp /tmp/lino_private_smoke.yaml /tmp/lino_private_smoke_resume.yaml
+sed -i \
+  -e 's/startup_mode: "cold_start"/startup_mode: "resume"/' \
+  -e 's#resume_checkpoint: null#resume_checkpoint: "./runs/lino_private_smoke/smoke/checkpoints/last.ckpt"#' \
+  -e 's/epochs: 1/epochs: 2/' \
+  /tmp/lino_private_smoke_resume.yaml
+python train_private.py --config /tmp/lino_private_smoke_resume.yaml --smoke
+```
+
+The second command must begin at epoch 2 and append, rather than repeat,
+the epoch-1 metrics row. Every smoke checkpoint/export sidecar must identify
+`run_kind: smoke` and `comparable: false`.
+
+For the smoke inference check, copy the paired inference preset and point it
+to the smoke export and a small isolated inference root (one or two objects
+with the same 16-light manifest). Keep the output outside the final comparison
+directory, and explicitly opt into the non-comparable smoke contract:
+
+```bash
+cp configs/lino_private_infer_trained_fixed.yaml /tmp/lino_private_smoke_infer.yaml
+sed -i \
+  -e 's#checkpoint: "./runs/lino_private_fixed_bf16/exports/lino_epoch_100.pth"#checkpoint: "./runs/lino_private_smoke/smoke/exports/lino_epoch_001.pth"#' \
+  -e 's#output_root: "./output/lino_private_trained_fixed"#output_root: "./output/lino_private_smoke"#' \
+  -e 's/require_checkpoint_data_contract: true/require_checkpoint_data_contract: true\nallow_non_comparable_checkpoint: true/' \
+  /tmp/lino_private_smoke_infer.yaml
+python eval.py --config /tmp/lino_private_smoke_infer.yaml
+```
+
+Verify signed 256x256 `normal_pred.exr` files, the printed inference time and
+VRAM fields, and the smoke `run.json`. Smoke outputs are acceptance evidence
+only: comparison scoring rejects them, and they must never be reported as the
+official SDM-versus-LINO result.
 
 ## 1. Clone LINO and install its environment
 
