@@ -1,7 +1,8 @@
 # SDM-EXR LINO–SDM Inference and Comparison Guide
 
-This guide covers only the new SDM-style EXR workflow on the
-`dev-lino-sdm-comparison` branch. It starts with environment installation and
+This guide covers the private LINO training workflow on the
+`dev-lino-private-training` branch and the released SDM-style EXR workflow
+below. It starts with environment installation and
 ends with paired LINO/SDM angular-error results.
 
 ## Released-checkpoint comparison (inference only)
@@ -196,7 +197,7 @@ directory, and explicitly opt into the non-comparable smoke contract:
 ```bash
 cp configs/lino_private_infer_trained_fixed.yaml /tmp/lino_private_smoke_infer.yaml
 sed -i \
-  -e 's#checkpoint: "./runs/lino_private_fixed_bf16/exports/lino_epoch_100.pth"#checkpoint: "./runs/lino_private_smoke/smoke/exports/lino_epoch_001.pth"#' \
+  -e 's#checkpoint: "./runs/lino_private_fixed_bf16/exports/lino_epoch_100.pth"#checkpoint: "./runs/lino_private_smoke/smoke/exports/lino_epoch_002.pth"#' \
   -e 's#output_root: "./output/lino_private_trained_fixed"#output_root: "./output/lino_private_smoke"#' \
   -e 's/require_checkpoint_data_contract: true/require_checkpoint_data_contract: true\nallow_non_comparable_checkpoint: true/' \
   /tmp/lino_private_smoke_infer.yaml

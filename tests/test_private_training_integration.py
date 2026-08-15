@@ -238,12 +238,21 @@ class _InferenceStub:
 class PrivateTrainingDocumentationTests(unittest.TestCase):
     def test_operator_guide_contains_primary_commands(self):
         guide = (REPO_ROOT / "README_train_infer.md").read_text(encoding="utf-8")
+        self.assertIn("`dev-lino-private-training` branch", guide)
         self.assertIn(
             "python train_private.py --config configs/lino_private_train_fixed.yaml",
             guide,
         )
         self.assertIn(
             "python eval.py --config configs/lino_private_infer_trained_fixed.yaml",
+            guide,
+        )
+        self.assertIn(
+            "./runs/lino_private_smoke/smoke/exports/lino_epoch_002.pth",
+            guide,
+        )
+        self.assertNotIn(
+            "./runs/lino_private_smoke/smoke/exports/lino_epoch_001.pth",
             guide,
         )
 
