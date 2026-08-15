@@ -69,6 +69,7 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertIsNone(config.selection_manifest)
         self.assertEqual(config.preprocessing_version, "released_transfer_v1")
         self.assertFalse(config.require_checkpoint_data_contract)
+        self.assertFalse(config.allow_non_comparable_checkpoint)
         self.assertEqual(config.policy_root, config.output_root / "external")
         self.assertEqual(config.lino_output_dir, config.policy_root / "lino")
         self.assertEqual(config.sdm_view_dir, config.policy_root / "sdm_input")
@@ -179,6 +180,7 @@ class SdmExrConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.preprocessing_version, "private_external_lino_native_v1")
         self.assertTrue(config.require_checkpoint_data_contract)
+        self.assertFalse(config.allow_non_comparable_checkpoint)
         self.assertEqual(config.light_selection, "manifest")
         self.assertEqual(config.max_image_num, 16)
         self.assertEqual(config.expected_source_geometry, (256, 256))
@@ -192,6 +194,11 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertEqual(full.policy_root.name, "full")
         with self.assertRaisesRegex(ValueError, "mask_policy"):
             self.load(mask_policy="oracle_gt")
+
+    def test_non_comparable_checkpoint_opt_in_is_explicit_and_typed(self):
+        self.assertTrue(self.load(allow_non_comparable_checkpoint=True).allow_non_comparable_checkpoint)
+        with self.assertRaisesRegex(ValueError, "allow_non_comparable_checkpoint"):
+            self.load(allow_non_comparable_checkpoint="true")
 
     def test_manifest_mode_requires_manifest_path(self):
         with self.assertRaisesRegex(ValueError, "selection_manifest"):

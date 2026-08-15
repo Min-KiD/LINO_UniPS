@@ -386,6 +386,18 @@ class ComparisonMetricsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "digest"):
             score_lino_and_sdm(config, self.request_path, config_path=self.config_path)
 
+    def test_score_rejects_non_comparable_smoke_provenance(self):
+        from src.comparison.metrics import score_lino_and_sdm
+
+        config, manifest, sdm_dir = self._prepare_scoring_fixture()
+        self._write_provenance(config, manifest, sdm_dir)
+        provenance = json.loads(config.provenance_path.read_text(encoding="utf-8"))
+        provenance["run_kind"] = "smoke"
+        provenance["comparable"] = False
+        config.provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "non-comparable|smoke"):
+            score_lino_and_sdm(config, self.request_path, config_path=self.config_path)
+
     def test_score_rejects_lino_policy_mismatch_independently(self):
         from src.comparison.metrics import score_lino_and_sdm
 

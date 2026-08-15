@@ -63,6 +63,9 @@ ModelLoader = Callable[[SdmExrInferenceConfig, torch.device], Any]
 DatasetFactory = Callable[[SdmExrInferenceConfig, DatasetManifest], Any]
 
 
+_PRIVATE_SOURCE_REVISION = "lino-private-exr-training-v1"
+
+
 def _precision_dtype(config: SdmExrInferenceConfig) -> torch.dtype:
     return {
         "bf16": torch.bfloat16,
@@ -93,8 +96,12 @@ def _geometry_pair(value: Any, *, label: str) -> tuple[int, int]:
     return int(value[0]), int(value[1])
 
 
-def _checkpoint_schema_fingerprint(checkpoint_bytes: bytes) -> str:
-    """Fingerprint a raw model-only checkpoint without constructing the model."""
+def _load_checkpoint_state_dict(
+    checkpoint_bytes: bytes,
+    *,
+    raw_only: bool,
+) -> Mapping[str, torch.Tensor]:
+    """Load a checkpoint payload, optionally enforcing the private raw boundary."""
 
     try:
         payload = torch.load(
@@ -104,16 +111,39 @@ def _checkpoint_schema_fingerprint(checkpoint_bytes: bytes) -> str:
         )
     except Exception as exc:
         raise ValueError("LINO checkpoint cannot be parsed for architecture validation") from exc
-    state_dict = payload
-    if isinstance(payload, Mapping) and "state_dict" in payload:
+    state_dict: Any = payload
+    if raw_only:
+        if not isinstance(payload, Mapping) or not payload:
+            raise ValueError(
+                "strict trained LINO inference requires a non-empty raw tensor-only .pth state dict"
+            )
+        if any(
+            not isinstance(name, str) or not isinstance(value, torch.Tensor)
+            for name, value in payload.items()
+        ):
+            raise ValueError(
+                "strict trained LINO inference requires a raw tensor-only .pth state dict; "
+                "checkpoint wrappers and artifact payloads are not accepted"
+            )
+    elif isinstance(payload, Mapping) and "state_dict" in payload:
         state_dict = payload["state_dict"]
     state_dict = _mapping(state_dict, label="LINO checkpoint state_dict")
     if not state_dict:
         raise ValueError("LINO checkpoint state_dict must be non-empty")
+    if raw_only and any(
+        not isinstance(name, str) or not isinstance(value, torch.Tensor)
+        for name, value in state_dict.items()
+    ):
+        raise ValueError("LINO checkpoint state_dict must contain named tensors")
+    return state_dict
+
+
+def _checkpoint_schema_fingerprint(checkpoint_bytes: bytes) -> str:
+    """Fingerprint a raw model-only checkpoint without constructing the model."""
+
+    state_dict = _load_checkpoint_state_dict(checkpoint_bytes, raw_only=True)
     entries: list[list[Any]] = []
     for name, value in state_dict.items():
-        if not isinstance(name, str) or not isinstance(value, torch.Tensor):
-            raise ValueError("LINO checkpoint state_dict must contain named tensors")
         entries.append([name, [int(dimension) for dimension in value.shape], str(value.dtype)])
     return sha256_bytes(canonical_json_bytes(entries))
 
@@ -133,6 +163,10 @@ def _validate_trained_export_sidecar(
     or allocating the released model.
     """
 
+    if checkpoint.suffix != ".pth":
+        raise ValueError(
+            "strict trained LINO inference requires a regular .pth model-only checkpoint"
+        )
     sidecar = checkpoint.with_suffix(".json")
     try:
         sidecar_identity_before = file_identity(sidecar, label="LINO checkpoint sidecar")
@@ -169,13 +203,28 @@ def _validate_trained_export_sidecar(
         raise ValueError(
             "LINO checkpoint sidecar preprocessing_version does not match inference config"
         )
-    if metadata.get("run_kind") != "experiment" or metadata.get("comparable") is not True:
-        raise ValueError("trained LINO inference requires a comparable experiment export")
+    run_kind = metadata.get("run_kind")
+    comparable = metadata.get("comparable")
+    accepted_smoke = (
+        config.allow_non_comparable_checkpoint
+        and run_kind == "smoke"
+        and comparable is False
+    )
+    if not (run_kind == "experiment" and comparable is True) and not accepted_smoke:
+        raise ValueError(
+            "trained LINO inference requires a comparable experiment export, or an "
+            "explicitly opted-in non-comparable smoke export"
+        )
 
     contract = _mapping(metadata.get("data_contract"), label="LINO sidecar data_contract")
     if contract.get("artifact_kind") != "lino_private_training_contract":
         raise ValueError("LINO sidecar data_contract artifact_kind is invalid")
-    if contract.get("run_kind") != "experiment" or contract.get("comparable") is not True:
+    contract_run_kind = contract.get("run_kind")
+    contract_comparable = contract.get("comparable")
+    if accepted_smoke:
+        if contract_run_kind != "smoke" or contract_comparable is not False:
+            raise ValueError("LINO sidecar smoke data_contract is inconsistent")
+    elif contract_run_kind != "experiment" or contract_comparable is not True:
         raise ValueError("LINO sidecar data_contract is not a comparable experiment")
     contract_architecture = _nonempty_text(
         contract.get("architecture_schema_sha256"),
@@ -187,6 +236,17 @@ def _validate_trained_export_sidecar(
         metadata.get("source_revision"),
         label="LINO checkpoint sidecar source_revision",
     )
+    contract_source_revision = _nonempty_text(
+        contract.get("source_revision"),
+        label="LINO sidecar data_contract source_revision",
+    )
+    if (
+        source_revision != contract_source_revision
+        or source_revision != _PRIVATE_SOURCE_REVISION
+    ):
+        raise ValueError(
+            "LINO sidecar source_revision does not match the approved private training revision"
+        )
     snapshot = _mapping(contract.get("config_snapshot"), label="LINO sidecar config_snapshot")
 
     expected_geometry = config.expected_source_geometry
@@ -203,6 +263,11 @@ def _validate_trained_export_sidecar(
         "mask_margin": config.mask_margin,
         "pixel_samples": config.pixel_samples,
         "preprocessing_version": config.preprocessing_version,
+        "object_suffix": config.object_suffix,
+        "image_prefix": config.image_prefix,
+        "image_extension": config.image_extension,
+        "normal_filenames": list(config.normal_filenames),
+        "seed": config.seed,
     }
     for field, expected in expected_snapshot.items():
         if snapshot.get(field) != expected:
@@ -222,8 +287,8 @@ def _validate_trained_export_sidecar(
         "sha256": sidecar_digest,
         "architecture_schema_sha256": architecture,
         "source_revision": source_revision,
-        "run_kind": str(metadata["run_kind"]),
-        "comparable": bool(metadata["comparable"]),
+        "run_kind": str(run_kind),
+        "comparable": bool(comparable),
     }
 
 
@@ -295,28 +360,32 @@ def load_local_lino_checkpoint(
     if not checkpoint.is_file():
         raise FileNotFoundError(f"LINO checkpoint does not exist: {checkpoint}")
 
-    # Keep this import local and import only the released normal architecture;
-    # no PBR model, optimizer, trainer, or network-backed hub loader is used.
-    from src.models.Net_module import LiNo_UniPS
-
-    model = LiNo_UniPS(pixel_samples=config.pixel_samples, task_name="SDM_EXR")
     raw = checkpoint_bytes
     if raw is None:
         raw = read_file_bytes(checkpoint, label="LINO checkpoint")
     if not isinstance(raw, bytes) or not raw:
         raise ValueError("LINO checkpoint snapshot must be nonempty bytes")
-    payload = torch.load(io.BytesIO(raw), weights_only=False, map_location="cpu")
-    state_dict = payload
-    if isinstance(payload, Mapping) and "state_dict" in payload:
-        state_dict = payload["state_dict"]
-    if not isinstance(state_dict, Mapping):
-        raise ValueError("LINO checkpoint must contain a state-dict mapping")
+
+    strict_route = bool(config.require_checkpoint_data_contract)
+    if strict_route and checkpoint.suffix != ".pth":
+        raise ValueError(
+            "strict trained LINO inference requires a regular .pth model-only checkpoint"
+        )
+    state_dict = _load_checkpoint_state_dict(raw, raw_only=strict_route)
+
+    # Keep this import local and import only the released normal architecture;
+    # no PBR model, optimizer, trainer, or network-backed hub loader is used.
+    # In the strict route the raw payload is parsed above, before construction
+    # or device transfer, so an artifact checkpoint cannot allocate the model.
+    from src.models.Net_module import LiNo_UniPS
+
+    model = LiNo_UniPS(pixel_samples=config.pixel_samples, task_name="SDM_EXR")
 
     # Match the author's released loaders in ``hubconf.py`` and
     # ``LiNo_UniPS.from_pretrained`` for the default route.  The paired private
     # export route opts into strict loading only after its sidecar/data gate
     # has been validated by ``run_lino_inference``.
-    model.load_state_dict(state_dict, strict=bool(config.require_checkpoint_data_contract))
+    model.load_state_dict(state_dict, strict=strict_route)
 
     # Preserve checkpoint parameter storage precision.  Autocast in the
     # inference loop controls operation precision without a permanent cast.
@@ -1166,6 +1235,15 @@ def _run_lino_inference_pinned(
         "preprocessing": lino_preprocessing_snapshot(config),
         "preprocessing_version": config.preprocessing_version,
         "require_checkpoint_data_contract": config.require_checkpoint_data_contract,
+        "allow_non_comparable_checkpoint": config.allow_non_comparable_checkpoint,
+        "source_revision": (
+            trained_export["source_revision"] if trained_export is not None else None
+        ),
+        "architecture_schema_sha256": (
+            trained_export["architecture_schema_sha256"]
+            if trained_export is not None
+            else None
+        ),
         "selected_light_count": int(config.max_image_num),
         "run_kind": (
             trained_export["run_kind"] if trained_export is not None else "released_transfer"

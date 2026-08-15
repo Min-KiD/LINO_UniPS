@@ -591,6 +591,12 @@ def _validate_lino_runtime_provenance(
 ) -> None:
     """Require the LINO run to pair with the exact current runtime inputs."""
 
+    if payload.get("run_kind") == "smoke":
+        raise ValueError(
+            "comparison scoring refuses non-comparable LINO smoke runs; use an "
+            "experiment export for final comparison"
+        )
+
     required = (
         "config_path",
         "config_sha256",

@@ -45,6 +45,7 @@ _OPTIONAL_CONFIG_FIELDS = frozenset(
         "expected_source_geometry",
         "preprocessing_version",
         "require_checkpoint_data_contract",
+        "allow_non_comparable_checkpoint",
     }
 )
 
@@ -98,6 +99,7 @@ class SdmExrInferenceConfig:
     expected_source_geometry: tuple[int, int] | None = None
     preprocessing_version: str = "released_transfer_v1"
     require_checkpoint_data_contract: bool = False
+    allow_non_comparable_checkpoint: bool = False
 
     def __post_init__(self) -> None:
         for name in ("checkpoint", "data_root", "output_root"):
@@ -132,6 +134,10 @@ class SdmExrInferenceConfig:
         _require_bool(
             self.require_checkpoint_data_contract,
             "require_checkpoint_data_contract",
+        )
+        _require_bool(
+            self.allow_non_comparable_checkpoint,
+            "allow_non_comparable_checkpoint",
         )
         if (
             self.require_checkpoint_data_contract
@@ -341,6 +347,10 @@ def load_sdm_exr_config(path: str | Path) -> SdmExrInferenceConfig:
         require_checkpoint_data_contract=_require_bool(
             raw.get("require_checkpoint_data_contract", False),
             "require_checkpoint_data_contract",
+        ),
+        allow_non_comparable_checkpoint=_require_bool(
+            raw.get("allow_non_comparable_checkpoint", False),
+            "allow_non_comparable_checkpoint",
         ),
         mask_margin=_require_int(raw["mask_margin"], "mask_margin"),
         max_image_resolution=_require_int(

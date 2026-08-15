@@ -181,9 +181,15 @@ class SdmExrInferenceTests(unittest.TestCase):
                     "mask_margin": 0,
                     "pixel_samples": 1,
                     "preprocessing_version": "private_external_lino_native_v1",
+                    "object_suffix": ".data",
+                    "image_prefix": "image",
+                    "image_extension": ".exr",
+                    "normal_filenames": ["local_normal.exr"],
+                    "seed": 20260710,
                     "light_selection": "seeded",
                     "max_image_num": 6,
                 },
+                "source_revision": "lino-private-exr-training-v1",
             },
         }
         if sidecar_overrides:
@@ -202,6 +208,17 @@ class SdmExrInferenceTests(unittest.TestCase):
             preprocessing_version="private_external_lino_native_v1",
             require_checkpoint_data_contract=True,
         )
+
+    def _strict_smoke_fixture(self) -> SdmExrInferenceConfig:
+        config = self._strict_private_fixture()
+        sidecar = config.checkpoint.with_suffix(".json")
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload["run_kind"] = "smoke"
+        payload["comparable"] = False
+        payload["data_contract"]["run_kind"] = "smoke"
+        payload["data_contract"]["comparable"] = False
+        sidecar.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        return replace(config, allow_non_comparable_checkpoint=True)
 
     def run_with_stub(self, config: SdmExrInferenceConfig):
         calls: list[dict] = []
@@ -282,6 +299,97 @@ class SdmExrInferenceTests(unittest.TestCase):
                     run_lino_inference(config, model_loader=loader)
                 loader.assert_not_called()
 
+    def test_trained_export_binds_all_source_contract_fields(self):
+        cases = (
+            ("object_suffix", ".other"),
+            ("image_prefix", "observation"),
+            ("image_extension", ".hdr"),
+            ("normal_filenames", ("other_normal.exr",)),
+            ("seed", 20260711),
+        )
+        for field, replacement in cases:
+            with self.subTest(field=field):
+                baseline = self._strict_private_fixture()
+                config = replace(baseline, **{field: replacement})
+                loader = mock.Mock(side_effect=AssertionError("model must not be allocated"))
+                with self.assertRaisesRegex(ValueError, field):
+                    run_lino_inference(config, model_loader=loader)
+                loader.assert_not_called()
+
+    def test_trained_export_requires_approved_matching_source_revision(self):
+        for label, overrides in (
+            ("source_revision", {"source_revision": "other-revision"}),
+            ("source_revision", {"data_contract": {"source_revision": "other-revision"}}),
+        ):
+            with self.subTest(overrides=overrides):
+                self._strict_private_fixture()
+                sidecar = self.checkpoint.with_suffix(".json")
+                payload = json.loads(sidecar.read_text(encoding="utf-8"))
+                if "data_contract" in overrides:
+                    payload["data_contract"]["source_revision"] = overrides["data_contract"][
+                        "source_revision"
+                    ]
+                else:
+                    payload["source_revision"] = overrides["source_revision"]
+                sidecar.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+                loader = mock.Mock(side_effect=AssertionError("model must not be allocated"))
+                with self.assertRaisesRegex(ValueError, label):
+                    run_lino_inference(self.config(
+                        max_image_num=16,
+                        light_selection="manifest",
+                        selection_manifest=self.root / "selected_lights.json",
+                        normal_encoding="unsigned",
+                        expected_source_geometry=(256, 256),
+                        preprocessing_version="private_external_lino_native_v1",
+                        require_checkpoint_data_contract=True,
+                    ), model_loader=loader)
+                loader.assert_not_called()
+
+    def test_strict_route_rejects_non_pth_and_wrapped_payload_before_model(self):
+        config = self._strict_private_fixture()
+        checkpoint_pt = self.checkpoint.with_suffix(".pt")
+        checkpoint_pt.write_bytes(self.checkpoint.read_bytes())
+        loader = mock.Mock(side_effect=AssertionError("model must not be allocated"))
+        with self.assertRaisesRegex(ValueError, r"regular \.pth"):
+            run_lino_inference(replace(config, checkpoint=checkpoint_pt), model_loader=loader)
+        loader.assert_not_called()
+
+        config = self._strict_private_fixture()
+        torch.save({"state_dict": {"weight": torch.ones(1)}}, self.checkpoint)
+        sidecar = self.checkpoint.with_suffix(".json")
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload["checkpoint_sha256"] = hashlib.sha256(self.checkpoint.read_bytes()).hexdigest()
+        sidecar.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "raw tensor-only|wrapper"):
+            run_lino_inference(config, model_loader=loader)
+        loader.assert_not_called()
+
+    def test_strict_smoke_export_requires_explicit_opt_in_and_preserves_provenance(self):
+        config = self._strict_private_fixture()
+        sidecar = config.checkpoint.with_suffix(".json")
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload["run_kind"] = "smoke"
+        payload["comparable"] = False
+        payload["data_contract"]["run_kind"] = "smoke"
+        payload["data_contract"]["comparable"] = False
+        sidecar.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        loader = mock.Mock(side_effect=AssertionError("model must not be allocated"))
+        with self.assertRaisesRegex(ValueError, "comparable|smoke"):
+            run_lino_inference(config, model_loader=loader)
+        loader.assert_not_called()
+
+        config = replace(config, allow_non_comparable_checkpoint=True)
+        result = run_lino_inference(config, model_loader=lambda *_args: _PositiveZStub([]))
+        self.assertEqual(result["run_kind"], "smoke")
+        self.assertFalse(result["comparable"])
+        self.assertTrue(result["allow_non_comparable_checkpoint"])
+
+    def test_strict_experiment_remains_comparable_even_if_opt_in_is_enabled(self):
+        config = replace(self._strict_private_fixture(), allow_non_comparable_checkpoint=True)
+        result = run_lino_inference(config, model_loader=lambda *_args: _PositiveZStub([]))
+        self.assertEqual(result["run_kind"], "experiment")
+        self.assertTrue(result["comparable"])
+
     def test_trained_route_loads_matching_export_and_records_pairing_provenance(self):
         config = self._strict_private_fixture()
         result = run_lino_inference(config, model_loader=lambda *_args: _PositiveZStub([]))
@@ -289,6 +397,11 @@ class SdmExrInferenceTests(unittest.TestCase):
         self.assertEqual(result["selected_light_count"], 16)
         self.assertEqual(result["run_kind"], "experiment")
         self.assertTrue(result["comparable"])
+        self.assertEqual(result["source_revision"], "lino-private-exr-training-v1")
+        self.assertEqual(
+            result["architecture_schema_sha256"],
+            inference._checkpoint_schema_fingerprint(config.checkpoint.read_bytes()),
+        )
         self.assertEqual(
             result["checkpoint_sidecar_sha256"],
             hashlib.sha256(config.checkpoint.with_suffix(".json").read_bytes()).hexdigest(),
@@ -1164,8 +1277,10 @@ class SdmExrInferenceTests(unittest.TestCase):
         )
         with mock.patch.dict(sys.modules, self._fake_model_modules(FakeLiNo)):
             with mock.patch.object(inference.torch.cuda, "is_available", return_value=True):
-                with mock.patch.object(inference.torch, "load", return_value={"weight": 1}):
-                    load_local_lino_checkpoint(config, torch.device("cuda"))
+                    with mock.patch.object(
+                        inference.torch, "load", return_value={"weight": torch.ones(1)}
+                    ):
+                        load_local_lino_checkpoint(config, torch.device("cuda"))
         self.assertTrue(captured["strict"])
 
     def test_malformed_prediction_shapes_and_nonfinite_values_fail(self):
