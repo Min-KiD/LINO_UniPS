@@ -163,10 +163,103 @@ Before committing to the full run, use an isolated one-epoch smoke config. It
 uses the same code path but limits the run to the first two manifest-ordered
 objects and writes below a separate `save_dir/smoke` directory:
 
+First create a fresh, two-object inference input and matching selection
+manifest. The destination data root and temporary manifest must be new/empty;
+the commands below refuse to overwrite either one. They copy regular object
+directories from the real final inference root, reject source symlinks, and
+write a manifest containing exactly two object keys. Each copied object keeps
+the exact ordered list from the full selected-lights JSON, with exactly 16
+unique light names. Do not replace this with a symlink or point smoke
+inference at the final eight-object root.
+
+```bash
+python - <<'PY'
+import json
+import shutil
+from pathlib import Path
+
+source_root = Path("/mnt/18TData/minhnv/inference")
+smoke_root = Path("/mnt/18TData/minhnv/inference_smoke")
+full_selection_path = Path(
+    "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/"
+    "selected_lights.json"
+)
+smoke_selection_path = Path("/tmp/lino_private_smoke_selected_lights.json")
+
+if smoke_root.exists() or smoke_selection_path.exists():
+    raise SystemExit(
+        "Refusing to overwrite smoke destinations; choose new/empty paths: "
+        f"{smoke_root} and {smoke_selection_path}"
+    )
+if not source_root.is_dir() or not full_selection_path.is_file():
+    raise SystemExit("Final inference root or full selected-lights JSON is missing")
+
+payload = json.loads(full_selection_path.read_text(encoding="utf-8"))
+if not isinstance(payload, dict) or len(payload) < 2:
+    raise SystemExit("Full selected-lights JSON must contain at least two object keys")
+if any(
+    not isinstance(name, str)
+    or Path(name).name != name
+    or "\\" in name
+    or name in {"", ".", ".."}
+    for name in payload
+):
+    raise SystemExit("Full selected-lights JSON contains an unsafe object key")
+object_names = sorted(payload)[:2]
+smoke_payload = {}
+
+for object_name in object_names:
+    values = payload[object_name]
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise SystemExit(f"{object_name} must contain a list of light names")
+    if (
+        len(values) != 16
+        or len(set(values)) != 16
+        or any(
+            Path(value).name != value
+            or "\\" in value
+            or value in {"", ".", ".."}
+            for value in values
+        )
+    ):
+        raise SystemExit(
+            f"{object_name} must preserve exactly 16 unique light names"
+        )
+    source_object = source_root / object_name
+    if not source_object.is_dir() or source_object.is_symlink():
+        raise SystemExit(f"Missing or symlinked source object: {source_object}")
+    if any(path.is_symlink() for path in source_object.rglob("*")):
+        raise SystemExit(f"Source object contains symlinks: {source_object}")
+    for value in values:
+        source_image = source_object / value
+        if not source_image.is_file() or source_image.is_symlink():
+            raise SystemExit(f"Missing or symlinked selected image: {source_image}")
+    smoke_payload[object_name] = list(values)
+
+smoke_root.mkdir()
+for object_name in object_names:
+    shutil.copytree(
+        source_root / object_name,
+        smoke_root / object_name,
+        symlinks=False,
+    )
+    if any(path.is_symlink() for path in (smoke_root / object_name).rglob("*")):
+        raise SystemExit(f"Copied smoke object contains a symlink: {object_name}")
+
+smoke_selection_path.write_text(
+    json.dumps(smoke_payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+print(f"Copied exactly two objects to {smoke_root}")
+print(f"Wrote matching 16-light manifest to {smoke_selection_path}")
+PY
+```
+
 ```bash
 cp configs/lino_private_train_fixed.yaml /tmp/lino_private_smoke.yaml
 sed -i \
   -e 's#save_dir: "./runs/lino_private_fixed_bf16"#save_dir: "./runs/lino_private_smoke"#' \
+  -e 's#final_selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"#final_selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
   -e 's/epochs: 100/epochs: 1/' \
   /tmp/lino_private_smoke.yaml
 python train_private.py --config /tmp/lino_private_smoke.yaml --smoke
@@ -189,15 +282,20 @@ The second command must begin at epoch 2 and append, rather than repeat,
 the epoch-1 metrics row. Every smoke checkpoint/export sidecar must identify
 `run_kind: smoke` and `comparable: false`.
 
-For the smoke inference check, copy the paired inference preset and point it
-to the smoke export and a small isolated inference root (one or two objects
-with the same 16-light manifest). Keep the output outside the final comparison
-directory, and explicitly opt into the non-comparable smoke contract:
+For the smoke inference check, copy the paired inference preset and override
+the checkpoint, `data_root`, `selection_manifest`, and output root. The two
+overrides intentionally point to the fresh two-object root and its matching
+manifest created above; both objects have exactly 16 unique light names in the
+same order as the full selected-lights JSON. Keep the output outside the final
+comparison directory, and explicitly opt into the non-comparable smoke
+contract:
 
 ```bash
 cp configs/lino_private_infer_trained_fixed.yaml /tmp/lino_private_smoke_infer.yaml
 sed -i \
   -e 's#checkpoint: "./runs/lino_private_fixed_bf16/exports/lino_epoch_100.pth"#checkpoint: "./runs/lino_private_smoke/smoke/exports/lino_epoch_002.pth"#' \
+  -e 's#data_root: "/mnt/18TData/minhnv/inference"#data_root: "/mnt/18TData/minhnv/inference_smoke"#' \
+  -e 's#selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"#selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
   -e 's#output_root: "./output/lino_private_trained_fixed"#output_root: "./output/lino_private_smoke"#' \
   -e 's/require_checkpoint_data_contract: true/require_checkpoint_data_contract: true\nallow_non_comparable_checkpoint: true/' \
   /tmp/lino_private_smoke_infer.yaml

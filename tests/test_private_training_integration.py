@@ -255,6 +255,21 @@ class PrivateTrainingDocumentationTests(unittest.TestCase):
             "./runs/lino_private_smoke/smoke/exports/lino_epoch_001.pth",
             guide,
         )
+        self.assertIn(
+            'data_root: "/mnt/18TData/minhnv/inference_smoke"',
+            guide,
+        )
+        self.assertIn(
+            'selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"',
+            guide,
+        )
+        self.assertIn(
+            'final_selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"',
+            guide,
+        )
+        self.assertIn("exactly two object keys", guide)
+        self.assertIn("exactly 16 unique light names", guide)
+        self.assertIn("shutil.copytree", guide)
 
 
 if __name__ == "__main__":
