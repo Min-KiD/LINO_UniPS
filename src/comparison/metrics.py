@@ -60,6 +60,7 @@ _LINEAR_METRIC_NAMES = (
     "accuracy_30",
     "accuracy_45",
 )
+_PRIVATE_SOURCE_REVISION = "lino-private-exr-training-v1"
 
 
 def _normal_array(value: Any, *, label: str) -> np.ndarray:
@@ -583,6 +584,115 @@ def _validate_provenance(
         raise ValueError(f"{label} output_path does not match explicit SDM output directory")
 
 
+def _valid_sha256_text(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _validate_strict_lino_runtime_provenance(
+    payload: Mapping[str, Any],
+    *,
+    config: SdmExrInferenceConfig,
+    checkpoint: Path,
+    checkpoint_raw: bytes,
+    checkpoint_digest: str,
+) -> None:
+    """Validate all provenance fields required for a trained final score."""
+
+    required = (
+        "run_kind",
+        "comparable",
+        "source_revision",
+        "architecture_schema_sha256",
+        "checkpoint_sidecar_path",
+        "checkpoint_sidecar_sha256",
+    )
+    for field in required:
+        if field not in payload:
+            raise ValueError(f"strict LINO run provenance is missing required field {field}")
+    if payload.get("run_kind") != "experiment":
+        raise ValueError("strict LINO run provenance run_kind must be experiment")
+    if payload.get("comparable") is not True:
+        raise ValueError("strict LINO run provenance comparable must be true")
+    if payload.get("source_revision") != _PRIVATE_SOURCE_REVISION:
+        raise ValueError(
+            "strict LINO run provenance source_revision does not match the approved private revision"
+        )
+    architecture = _valid_sha256_text(
+        payload.get("architecture_schema_sha256"),
+        label="strict LINO run provenance architecture_schema_sha256",
+    )
+
+    sidecar = checkpoint.with_suffix(".json")
+    if not _same_path(payload.get("checkpoint_sidecar_path"), sidecar):
+        raise ValueError("strict LINO run provenance checkpoint_sidecar_path does not match checkpoint")
+    try:
+        sidecar_identity_before = file_identity(sidecar, label="LINO checkpoint sidecar")
+        sidecar_raw = _read_regular_file_once(sidecar, label="LINO checkpoint sidecar")
+        sidecar_identity_after = file_identity(sidecar, label="LINO checkpoint sidecar")
+    except (OSError, ValueError) as exc:
+        raise ValueError("strict LINO checkpoint sidecar is missing or invalid") from exc
+    if sidecar_identity_after != sidecar_identity_before:
+        raise ValueError("strict LINO checkpoint sidecar was replaced while scoring")
+    sidecar_digest = sha256_bytes(sidecar_raw)
+    if payload.get("checkpoint_sidecar_sha256") != sidecar_digest:
+        raise ValueError("strict LINO run provenance checkpoint sidecar digest is stale")
+    try:
+        sidecar_metadata = json.loads(sidecar_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("strict LINO checkpoint sidecar is not valid JSON") from exc
+    if not isinstance(sidecar_metadata, Mapping):
+        raise ValueError("strict LINO checkpoint sidecar must be a JSON object")
+    if sidecar_metadata.get("artifact_kind") != "lino_private_inference_weights":
+        raise ValueError("strict LINO checkpoint sidecar artifact_kind is invalid")
+    if sidecar_metadata.get("checkpoint_sha256") != checkpoint_digest:
+        raise ValueError("strict LINO checkpoint sidecar checkpoint digest is stale")
+    if sidecar_metadata.get("run_kind") != "experiment":
+        raise ValueError("strict LINO checkpoint sidecar run_kind must be experiment")
+    if sidecar_metadata.get("comparable") is not True:
+        raise ValueError("strict LINO checkpoint sidecar comparable must be true")
+    if sidecar_metadata.get("source_revision") != _PRIVATE_SOURCE_REVISION:
+        raise ValueError("strict LINO checkpoint sidecar source_revision is invalid")
+    sidecar_architecture = _valid_sha256_text(
+        sidecar_metadata.get("architecture_schema_sha256"),
+        label="strict LINO checkpoint sidecar architecture_schema_sha256",
+    )
+    if sidecar_architecture != architecture:
+        raise ValueError("strict LINO architecture fingerprint differs from sidecar")
+
+    contract = sidecar_metadata.get("data_contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("strict LINO checkpoint sidecar data_contract is missing")
+    if contract.get("artifact_kind") != "lino_private_training_contract":
+        raise ValueError("strict LINO sidecar data_contract artifact_kind is invalid")
+    if contract.get("run_kind") != "experiment":
+        raise ValueError("strict LINO sidecar data_contract run_kind must be experiment")
+    if contract.get("comparable") is not True:
+        raise ValueError("strict LINO sidecar data_contract comparable must be true")
+    if contract.get("source_revision") != _PRIVATE_SOURCE_REVISION:
+        raise ValueError("strict LINO sidecar data_contract source_revision is invalid")
+    contract_architecture = _valid_sha256_text(
+        contract.get("architecture_schema_sha256"),
+        label="strict LINO sidecar data_contract architecture_schema_sha256",
+    )
+    if contract_architecture != architecture:
+        raise ValueError("strict LINO architecture fingerprint differs from data contract")
+
+    # Recompute the architecture fingerprint from the immutable checkpoint
+    # bytes.  The helper is imported lazily because inference imports metrics
+    # for its runtime metric primitives.
+    from .inference import _checkpoint_schema_fingerprint
+
+    checkpoint_architecture = _checkpoint_schema_fingerprint(checkpoint_raw)
+    if checkpoint_architecture != architecture:
+        raise ValueError("strict LINO architecture fingerprint differs from checkpoint")
+
+
 def _validate_lino_runtime_provenance(
     payload: Mapping[str, Any],
     *,
@@ -639,6 +749,14 @@ def _validate_lino_runtime_provenance(
         raise ValueError("LINO run provenance checkpoint identity is stale")
     if payload.get("preprocessing") != lino_preprocessing_snapshot(config):
         raise ValueError("LINO run provenance preprocessing knobs are stale")
+    if config.require_checkpoint_data_contract:
+        _validate_strict_lino_runtime_provenance(
+            payload,
+            config=config,
+            checkpoint=checkpoint,
+            checkpoint_raw=checkpoint_raw,
+            checkpoint_digest=expected_checkpoint_digest,
+        )
 
 
 def _expected_lino_paths(

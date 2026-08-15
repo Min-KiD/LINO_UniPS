@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import torch
 
 from src.comparison.config import SdmExrInferenceConfig
 from src.comparison.exr_io import sha256_file, write_normal_exr
@@ -309,6 +310,131 @@ class ComparisonMetricsTests(unittest.TestCase):
                 config,
                 self.request_path,
                 config_path=self.config_path,
+            )
+
+    def _strict_runtime_provenance_fixture(self):
+        from src.comparison.inference import _checkpoint_schema_fingerprint
+        from src.comparison.provenance import config_runtime_fingerprint, file_identity
+
+        selection = self.root / "strict-selection.json"
+        selection.write_text("{}\n", encoding="utf-8")
+        config = self.config(
+            max_image_num=16,
+            light_selection="manifest",
+            selection_manifest=selection,
+            normal_encoding="unsigned",
+            expected_source_geometry=(256, 256),
+            mask_margin=8,
+            max_image_resolution=512,
+            preprocessing_version="private_external_lino_native_v1",
+            require_checkpoint_data_contract=True,
+        )
+        config_path = self._write_config(config)
+        config.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"weight": torch.ones(1)}, config.checkpoint)
+        checkpoint_raw = config.checkpoint.read_bytes()
+        checkpoint_digest = sha256_file(config.checkpoint)
+        architecture = _checkpoint_schema_fingerprint(checkpoint_raw)
+        sidecar = config.checkpoint.with_suffix(".json")
+        sidecar_payload = {
+            "artifact_kind": "lino_private_inference_weights",
+            "checkpoint_sha256": checkpoint_digest,
+            "architecture_schema_sha256": architecture,
+            "source_revision": "lino-private-exr-training-v1",
+            "run_kind": "experiment",
+            "comparable": True,
+            "data_contract": {
+                "artifact_kind": "lino_private_training_contract",
+                "architecture_schema_sha256": architecture,
+                "source_revision": "lino-private-exr-training-v1",
+                "run_kind": "experiment",
+                "comparable": True,
+            },
+        }
+        sidecar.write_text(json.dumps(sidecar_payload) + "\n", encoding="utf-8")
+        payload = {
+            "config_path": str(config_path.resolve(strict=True)),
+            "config_sha256": sha256_file(config_path),
+            "config_runtime_fingerprint": config_runtime_fingerprint(config),
+            "checkpoint_path": str(config.checkpoint.resolve(strict=True)),
+            "checkpoint_sha256": checkpoint_digest,
+            "checkpoint_identity": file_identity(config.checkpoint, label="LINO checkpoint"),
+            "checkpoint_sidecar_path": str(sidecar.resolve(strict=True)),
+            "checkpoint_sidecar_sha256": sha256_file(sidecar),
+            "preprocessing": {
+                "mask_margin": config.mask_margin,
+                "max_image_resolution": config.max_image_resolution,
+                "pixel_samples": config.pixel_samples,
+                "precision": config.precision,
+                "device": config.device,
+                "checkpoint": str(config.checkpoint),
+            },
+            "run_kind": "experiment",
+            "comparable": True,
+            "source_revision": "lino-private-exr-training-v1",
+            "architecture_schema_sha256": architecture,
+        }
+        return config, config_path, payload, sidecar
+
+    def test_strict_score_provenance_requires_comparable_experiment_metadata(self):
+        from src.comparison.metrics import _validate_lino_runtime_provenance
+
+        config, config_path, payload, _sidecar = self._strict_runtime_provenance_fixture()
+        _validate_lino_runtime_provenance(
+            payload,
+            config=config,
+            config_path=config_path,
+        )
+
+        cases = (
+            ("experiment_false", {"comparable": False}, "comparable"),
+            ("smoke", {"run_kind": "smoke"}, "smoke"),
+            ("unknown", {"run_kind": "unknown"}, "run_kind"),
+            ("source", {"source_revision": "other"}, "source_revision"),
+            ("architecture", {"architecture_schema_sha256": "0" * 64}, "architecture"),
+        )
+        for label, updates, pattern in cases:
+            with self.subTest(label=label):
+                config, config_path, payload, _sidecar = self._strict_runtime_provenance_fixture()
+                payload.update(updates)
+                with self.assertRaisesRegex(ValueError, pattern):
+                    _validate_lino_runtime_provenance(
+                        payload,
+                        config=config,
+                        config_path=config_path,
+                    )
+
+        for missing in (
+            "run_kind",
+            "comparable",
+            "source_revision",
+            "architecture_schema_sha256",
+            "checkpoint_sidecar_path",
+            "checkpoint_sidecar_sha256",
+        ):
+            with self.subTest(missing=missing):
+                config, config_path, payload, _sidecar = self._strict_runtime_provenance_fixture()
+                payload.pop(missing)
+                with self.assertRaisesRegex(ValueError, missing):
+                    _validate_lino_runtime_provenance(
+                        payload,
+                        config=config,
+                        config_path=config_path,
+                    )
+
+    def test_strict_score_provenance_binds_sidecar_and_checkpoint_fingerprints(self):
+        from src.comparison.metrics import _validate_lino_runtime_provenance
+
+        config, config_path, payload, sidecar = self._strict_runtime_provenance_fixture()
+        sidecar_payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        sidecar_payload["data_contract"]["architecture_schema_sha256"] = "0" * 64
+        sidecar.write_text(json.dumps(sidecar_payload) + "\n", encoding="utf-8")
+        payload["checkpoint_sidecar_sha256"] = sha256_file(sidecar)
+        with self.assertRaisesRegex(ValueError, "data contract|architecture"):
+            _validate_lino_runtime_provenance(
+                payload,
+                config=config,
+                config_path=config_path,
             )
 
     def test_score_uses_paired_layout_shared_gt_support_and_weighted_aggregates(self):
