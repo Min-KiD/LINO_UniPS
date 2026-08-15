@@ -735,6 +735,10 @@ def _validate_lino_runtime_provenance(
             raise ValueError("LINO run provenance config digest is stale")
 
     checkpoint = Path(config.checkpoint)
+    if config.require_checkpoint_data_contract and checkpoint.suffix != ".pth":
+        raise ValueError(
+            "strict LINO scoring requires a regular .pth model-only checkpoint"
+        )
     checkpoint_identity_before = file_identity(checkpoint, label="LINO checkpoint")
     checkpoint_raw = _read_regular_file_once(checkpoint, label="LINO checkpoint")
     expected_checkpoint_digest = sha256_bytes(checkpoint_raw)

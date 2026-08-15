@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -435,6 +436,47 @@ class ComparisonMetricsTests(unittest.TestCase):
                 payload,
                 config=config,
                 config_path=config_path,
+            )
+
+    def test_strict_score_provenance_requires_final_pth_checkpoint_artifact(self):
+        from src.comparison.metrics import _validate_lino_runtime_provenance
+        from src.comparison.provenance import (
+            config_runtime_fingerprint,
+            file_identity,
+            lino_preprocessing_snapshot,
+        )
+
+        config, _config_path, payload, sidecar = self._strict_runtime_provenance_fixture()
+        _validate_lino_runtime_provenance(
+            payload,
+            config=config,
+            config_path=self.root / "config.yaml",
+        )
+
+        checkpoint = config.checkpoint.with_suffix(".pt")
+        checkpoint.write_bytes(config.checkpoint.read_bytes())
+        pt_sidecar = checkpoint.with_suffix(".json")
+        pt_sidecar.write_bytes(sidecar.read_bytes())
+        pt_config = replace(config, checkpoint=checkpoint)
+        pt_config_path = self._write_config(pt_config)
+        payload.update(
+            {
+                "config_path": str(pt_config_path.resolve(strict=True)),
+                "config_sha256": sha256_file(pt_config_path),
+                "config_runtime_fingerprint": config_runtime_fingerprint(pt_config),
+                "checkpoint_path": str(checkpoint.resolve(strict=True)),
+                "checkpoint_sha256": sha256_file(checkpoint),
+                "checkpoint_identity": file_identity(checkpoint, label="LINO checkpoint"),
+                "checkpoint_sidecar_path": str(pt_sidecar.resolve(strict=True)),
+                "checkpoint_sidecar_sha256": sha256_file(pt_sidecar),
+                "preprocessing": lino_preprocessing_snapshot(pt_config),
+            }
+        )
+        with self.assertRaisesRegex(ValueError, r"\.pth"):
+            _validate_lino_runtime_provenance(
+                payload,
+                config=pt_config,
+                config_path=pt_config_path,
             )
 
     def test_score_uses_paired_layout_shared_gt_support_and_weighted_aggregates(self):
