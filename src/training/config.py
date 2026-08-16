@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields, is_dataclass
 from math import isfinite
 from numbers import Real
 from pathlib import Path
@@ -68,6 +68,24 @@ def _bool_value(value: object, field_name: str) -> bool:
 
 
 @dataclass(frozen=True)
+class SourceValidationConfig:
+    mode: str = "lazy"
+    structural_index_version: str = "private_exr_index_v1"
+    persistent_content_ledger: bool = False
+    progress_every_objects: int = 100
+
+    def __post_init__(self) -> None:
+        if self.mode != "lazy":
+            raise ValueError("private training supports lazy source validation only")
+        if self.structural_index_version != "private_exr_index_v1":
+            raise ValueError("unsupported structural index version")
+        if self.persistent_content_ledger:
+            raise ValueError("persistent content ledger is not supported")
+        if not _is_int(self.progress_every_objects) or self.progress_every_objects <= 0:
+            raise ValueError("progress_every_objects must be a positive integer")
+
+
+@dataclass(frozen=True)
 class PrivateTrainConfig:
     train_dir: Path
     test_dir: Path
@@ -107,6 +125,9 @@ class PrivateTrainConfig:
     scheduler_gamma: float
     save_every_epochs: int
     keep_milestone_epochs: tuple[int, ...]
+    source_validation: SourceValidationConfig = field(
+        default_factory=SourceValidationConfig
+    )
 
     def __post_init__(self) -> None:
         path_fields = (
@@ -237,6 +258,8 @@ class PrivateTrainConfig:
             raise ValueError("keep_milestone_epochs must contain positive integers")
         if tuple(sorted(set(self.keep_milestone_epochs))) != self.keep_milestone_epochs:
             raise ValueError("keep_milestone_epochs must be unique and sorted")
+        if not isinstance(self.source_validation, SourceValidationConfig):
+            raise ValueError("source_validation must be a SourceValidationConfig")
 
 
 _CONFIG_FIELDS = tuple(field.name for field in fields(PrivateTrainConfig))
@@ -277,6 +300,33 @@ def _geometry(value: object) -> tuple[int, int]:
 def _milestones(value: object) -> tuple[int, ...]:
     milestones = _sequence_value(value, "keep_milestone_epochs")
     return tuple(_int_value(item, "keep_milestone_epochs") for item in milestones)
+
+
+def _source_validation(value: object) -> SourceValidationConfig:
+    mapping = _raw_mapping(value)
+    expected = {field.name for field in fields(SourceValidationConfig)}
+    unknown = sorted(set(mapping) - expected)
+    if unknown:
+        raise ValueError(
+            "unknown source_validation keys: " + ", ".join(unknown)
+        )
+    missing = sorted(expected - set(mapping))
+    if missing:
+        raise ValueError(
+            "missing source_validation keys: " + ", ".join(missing)
+        )
+    return SourceValidationConfig(
+        mode=_string_value(mapping["mode"], "source_validation.mode"),
+        structural_index_version=_string_value(
+            mapping["structural_index_version"],
+            "source_validation.structural_index_version",
+        ),
+        persistent_content_ledger=_bool_value(
+            mapping["persistent_content_ledger"],
+            "source_validation.persistent_content_ledger",
+        ),
+        progress_every_objects=mapping["progress_every_objects"],  # type: ignore[arg-type]
+    )
 
 
 def load_private_train_config(path: str | Path) -> PrivateTrainConfig:
@@ -347,6 +397,7 @@ def load_private_train_config(path: str | Path) -> PrivateTrainConfig:
         scheduler_gamma=_float_value(values["scheduler_gamma"], "scheduler_gamma"),
         save_every_epochs=int_field("save_every_epochs"),
         keep_milestone_epochs=_milestones(values["keep_milestone_epochs"]),
+        source_validation=_source_validation(values["source_validation"]),
     )
 
 
@@ -357,6 +408,11 @@ def _resolved_value(value: object) -> object:
         return [_resolved_value(item) for item in value]
     if isinstance(value, list):
         return [_resolved_value(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _resolved_value(getattr(value, item.name))
+            for item in fields(value)
+        }
     return value
 
 

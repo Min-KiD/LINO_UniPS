@@ -61,6 +61,12 @@ class PrivateTrainingConfigTests(unittest.TestCase):
             "scheduler_gamma": 0.5,
             "save_every_epochs": 5,
             "keep_milestone_epochs": [10, 25, 50],
+            "source_validation": {
+                "mode": "lazy",
+                "structural_index_version": "private_exr_index_v1",
+                "persistent_content_ledger": False,
+                "progress_every_objects": 100,
+            },
         }
 
     def _write_yaml(self, values: dict[object, object]) -> Path:
@@ -156,8 +162,40 @@ class PrivateTrainingConfigTests(unittest.TestCase):
                 "scheduler_gamma": 0.5,
                 "save_every_epochs": 5,
                 "keep_milestone_epochs": [10, 25, 50],
+                "source_validation": {
+                    "mode": "lazy",
+                    "structural_index_version": "private_exr_index_v1",
+                    "persistent_content_ledger": False,
+                    "progress_every_objects": 100,
+                },
             },
         )
+
+    def test_source_validation_contract_is_lazy_only_and_strict(self):
+        for field_name, value, message in (
+            ("mode", "eager", "lazy source validation only"),
+            ("structural_index_version", "other", "structural index version"),
+            ("persistent_content_ledger", True, "content ledger"),
+            ("progress_every_objects", 0, "positive integer"),
+            ("progress_every_objects", True, "positive integer"),
+        ):
+            with self.subTest(field_name=field_name), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                raw = self.valid_mapping()
+                raw["source_validation"][field_name] = value
+                load_private_train_config(self._write_yaml(raw))
+
+    def test_source_validation_rejects_missing_and_unknown_nested_keys(self):
+        raw = self.valid_mapping()
+        del raw["source_validation"]["mode"]
+        with self.assertRaisesRegex(ValueError, "source_validation.*mode"):
+            load_private_train_config(self._write_yaml(raw))
+
+        raw = self.valid_mapping()
+        raw["source_validation"]["unexpected"] = 1
+        with self.assertRaisesRegex(ValueError, "source_validation.*unexpected"):
+            load_private_train_config(self._write_yaml(raw))
 
     def test_loader_converts_paths_and_sequences(self):
         config = load_private_train_config(self._write_yaml(self.valid_mapping()))
