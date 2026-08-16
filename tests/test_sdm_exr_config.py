@@ -161,10 +161,7 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertEqual(config.light_selection, "manifest")
         self.assertEqual(
             config.selection_manifest,
-            Path(
-                "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/"
-                "external/selected_lights.json"
-            ),
+            Path("output/sdm_lino_comparison/external/selected_lights.json"),
         )
         self.assertEqual(config.normal_encoding, "unsigned")
         self.assertEqual(config.mask_policy, "external")

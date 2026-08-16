@@ -7,7 +7,7 @@ save_dir: "./runs/lino_private_fixed_lazy_sdmvalid_bf16"
 startup_mode: "cold_start"
 init_checkpoint: null
 resume_checkpoint: null
-final_selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"
+final_selection_manifest: "./output/sdm_lino_comparison/external/selected_lights.json"
 object_suffix: ".data"
 image_prefix: "image"
 image_extension: ".exr"

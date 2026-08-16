@@ -373,6 +373,9 @@ class PrivateTrainingConfigTests(unittest.TestCase):
 
     def test_checked_in_lazy_presets_are_isolated_and_paired(self):
         repo_root = Path(__file__).resolve().parents[1]
+        canonical_selection = (
+            "output/sdm_lino_comparison/external/selected_lights.json"
+        )
         config = load_private_train_config(
             repo_root / "configs/lino_private_train_fixed.yaml"
         )
@@ -380,6 +383,7 @@ class PrivateTrainingConfigTests(unittest.TestCase):
             str(config.save_dir), "runs/lino_private_fixed_lazy_sdmvalid_bf16"
         )
         self.assertEqual(config.source_validation.mode, "lazy")
+        self.assertEqual(str(config.final_selection_manifest), canonical_selection)
         inference_yaml = (
             repo_root / "configs/lino_private_infer_trained_fixed.yaml"
         ).read_text(encoding="utf-8")
@@ -391,6 +395,9 @@ class PrivateTrainingConfigTests(unittest.TestCase):
         self.assertIn(
             'output_root: "./output/lino_private_trained_lazy_sdmvalid"',
             inference_yaml,
+        )
+        self.assertIn(
+            f'selection_manifest: "./{canonical_selection}"', inference_yaml
         )
 
 

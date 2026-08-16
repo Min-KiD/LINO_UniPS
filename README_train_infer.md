@@ -35,13 +35,22 @@ python -m pip install -r requirements.txt
 test -d /mnt/18TData/minhnv/train
 test -d /mnt/18TData/minhnv/test
 test -d /mnt/18TData/minhnv/inference
-test -f /mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json
+test -f output/sdm_lino_comparison/external/selected_lights.json
 ```
 
 The training preset expects each train/test object to contain finite
 `image*.exr` observations, `local_normal.exr`, and an independently generated
 `binary_mask.exr`, all at 256x256. The final-selection manifest is used only
 to bind the later 16-light comparison; it must exist before training starts.
+It is the canonical manifest written by the earlier seeded comparison run. If
+the check fails, locate any prior manifest with:
+
+```bash
+find output -name selected_lights.json -print
+```
+
+Use only the manifest from the intended `sdm_lino_comparison/external`
+protocol; do not substitute an unrelated selection.
 
 ### Cold-start training
 
@@ -275,7 +284,7 @@ PY
 cp configs/lino_private_train_fixed.yaml /tmp/lino_private_smoke.yaml
 sed -i \
   -e 's#save_dir: "./runs/lino_private_fixed_lazy_sdmvalid_bf16"#save_dir: "./runs/lino_private_smoke"#' \
-  -e 's#final_selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"#final_selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
+  -e 's#final_selection_manifest: "./output/sdm_lino_comparison/external/selected_lights.json"#final_selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
   -e 's/epochs: 100/epochs: 1/' \
   /tmp/lino_private_smoke.yaml
 python train_private.py --config /tmp/lino_private_smoke.yaml --smoke
@@ -311,7 +320,7 @@ cp configs/lino_private_infer_trained_fixed.yaml /tmp/lino_private_smoke_infer.y
 sed -i \
   -e 's#checkpoint: "./runs/lino_private_fixed_lazy_sdmvalid_bf16/exports/lino_epoch_100.pth"#checkpoint: "./runs/lino_private_smoke/smoke/exports/lino_epoch_002.pth"#' \
   -e 's#data_root: "/mnt/18TData/minhnv/inference"#data_root: "/mnt/18TData/minhnv/inference_smoke"#' \
-  -e 's#selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"#selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
+  -e 's#selection_manifest: "./output/sdm_lino_comparison/external/selected_lights.json"#selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
   -e 's#output_root: "./output/lino_private_trained_lazy_sdmvalid"#output_root: "./output/lino_private_smoke"#' \
   -e 's/require_checkpoint_data_contract: true/require_checkpoint_data_contract: true\nallow_non_comparable_checkpoint: true/' \
   /tmp/lino_private_smoke_infer.yaml
@@ -559,7 +568,7 @@ output root and replaces seeded selection with the exact ordered light list
 already written by the successful transfer run:
 
 ```text
-/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json
+output/sdm_lino_comparison/external/selected_lights.json
 ```
 
 The completion record is written only after all objects finish:

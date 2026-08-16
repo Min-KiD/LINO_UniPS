@@ -272,6 +272,10 @@ class PrivateTrainingDocumentationTests(unittest.TestCase):
         self.assertIn("SDM does not require retraining", guide)
         self.assertIn("eight files", guide)
         self.assertIn("lino-private-exr-training-v2", guide)
+        self.assertIn(
+            "output/sdm_lino_comparison/external/selected_lights.json", guide
+        )
+        self.assertIn("find output -name selected_lights.json", guide)
 
 
 if __name__ == "__main__":
