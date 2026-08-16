@@ -141,12 +141,34 @@ class ComparisonMetricsTests(unittest.TestCase):
             dtype=np.float32,
         )
         support = normal_validity_mask(gt)
-        np.testing.assert_array_equal(support, [[False, True], [False, True]])
+        np.testing.assert_array_equal(support, [[False, True], [False, False]])
         prediction = gt.copy()
         prediction[1, 1] = [0.0, 1.0, 1.0]
         metrics = angular_metrics(gt, prediction, support)
-        self.assertEqual(metrics["valid_pixel_count"], 2)
+        self.assertEqual(metrics["valid_pixel_count"], 1)
         self.assertAlmostEqual(metrics["mae"], 0.0, places=5)
+
+    def test_normal_validity_matches_sdm_corrected_v2_unit_band(self):
+        from src.comparison.metrics import GT_VALIDITY_POLICY, normal_validity_mask
+
+        self.assertEqual(GT_VALIDITY_POLICY, "sdm_corrected_v2_unit_band")
+
+        normal = np.asarray(
+            [[
+                [0.0, 0.0, 0.0],
+                [1.0e-4, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.499, 0.0, 0.0],
+                [1.5, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ]],
+            dtype=np.float32,
+        )
+        expected = np.asarray(
+            [[False, False, False, True, True, False, False]], dtype=bool
+        )
+        np.testing.assert_array_equal(normal_validity_mask(normal), expected)
 
     def test_empty_support_is_rejected(self):
         from src.comparison.metrics import angular_metrics
@@ -159,7 +181,7 @@ class ComparisonMetricsTests(unittest.TestCase):
         from src.comparison.metrics import angular_metrics, normal_validity_mask
 
         huge = np.asarray([[[1.0e200, -1.0e200, 1.0e200]]], dtype=np.float64)
-        np.testing.assert_array_equal(normal_validity_mask(huge), [[True]])
+        np.testing.assert_array_equal(normal_validity_mask(huge), [[False]])
         self.assertAlmostEqual(
             angular_metrics(huge, huge.copy(), np.ones((1, 1), dtype=bool))["mae"],
             0.0,

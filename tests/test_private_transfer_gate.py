@@ -88,6 +88,23 @@ class PrivateTransferGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GT-valid.*outside.*mask"):
             preflight_transfer_sources(config, manifest)
 
+    def test_preflight_ignores_low_magnitude_gt_outside_external_mask(self):
+        object_dir = make_unsigned_object(self.data_root, "alpha.data")
+        encoded = np.full((2, 3, 3), 0.5, dtype=np.float32)
+        encoded[:, :2, 2] = 1.0
+        encoded[1, 2, 0] = 0.50005
+        write_rgb_exr(object_dir / "local_normal.exr", encoded)
+        config = self.config()
+        manifest = build_dataset_manifest(config)
+
+        report = preflight_transfer_sources(config, manifest)["alpha.data"]
+
+        self.assertEqual(report["decoded_gt_valid_pixel_count"], 4)
+        self.assertEqual(report["gt_outside_mask_pixel_count"], 0)
+        self.assertEqual(
+            report["gt_validity_policy"], "sdm_corrected_v2_unit_band"
+        )
+
     def test_preflight_enforces_declared_source_geometry(self):
         make_unsigned_object(self.data_root, "alpha.data")
         config = self.config(expected_source_geometry=(256, 256))

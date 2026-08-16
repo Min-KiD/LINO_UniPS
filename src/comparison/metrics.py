@@ -45,6 +45,7 @@ from .sdm_view import build_sdm_command, validate_sdm_view
 
 
 _NORMAL_EPS = 1.0e-12
+GT_VALIDITY_POLICY = "sdm_corrected_v2_unit_band"
 _METRIC_NAMES = (
     "mae",
     "median",
@@ -144,7 +145,7 @@ def _stable_normalize(array: np.ndarray) -> np.ndarray:
 
 
 def normal_validity_mask(normal: Any) -> np.ndarray:
-    """Return support from finite, non-negligible source GT vectors only.
+    """Return the exact source-GT support used by SDM corrected-v2.
 
     This mask deliberately has no knowledge of either model's input mask.  A
     caller may choose another explicit boolean mask for :func:`angular_metrics`,
@@ -152,7 +153,12 @@ def normal_validity_mask(normal: Any) -> np.ndarray:
     """
 
     array = _normal_array(normal, label="normal")
-    return _stable_normal_validity(array)
+    with np.errstate(over="ignore", invalid="ignore"):
+        lengths = np.linalg.norm(np.asarray(array, dtype=np.float32), axis=2)
+    return np.asarray(
+        np.isfinite(lengths) & (np.abs(lengths - 1.0) < 0.5),
+        dtype=bool,
+    )
 
 
 def angular_metrics(gt: Any, pred: Any, mask: Any) -> dict[str, float | int]:
@@ -1417,6 +1423,7 @@ def score_lino_and_sdm(
         "objects": len(rows),
         "valid_pixel_count": total_valid,
         "mask_policy": config.mask_policy,
+        "gt_validity_policy": GT_VALIDITY_POLICY,
         "input_manifest_sha256": digests["input_manifest_sha256"],
         "selection_manifest_sha256": digests["selection_manifest_sha256"],
         "effective_selection_manifest_sha256": digests["effective_selection_manifest_sha256"],
@@ -1467,6 +1474,7 @@ def score_lino_and_sdm(
 
 
 __all__ = [
+    "GT_VALIDITY_POLICY",
     "normal_validity_mask",
     "angular_metrics",
     "load_source_gt",

@@ -44,7 +44,12 @@ from .provenance import (
     lino_preprocessing_snapshot,
     sha256_bytes,
 )
-from .metrics import angular_metrics, load_source_gt, normal_validity_mask
+from .metrics import (
+    GT_VALIDITY_POLICY,
+    angular_metrics,
+    load_source_gt,
+    normal_validity_mask,
+)
 from .reporting import (
     estimate_eta_seconds,
     format_clock_duration,
@@ -1254,6 +1259,7 @@ def _run_lino_inference_pinned(
         "repository_commit": _repository_commit(repo_root),
         "mask_policy": config.mask_policy,
         "normal_encoding": config.normal_encoding,
+        "gt_validity_policy": GT_VALIDITY_POLICY,
         "input_manifest_sha256": input_digest,
         "selection_manifest_sha256": selection_digest,
         "effective_selection_manifest_sha256": canonical_digest,

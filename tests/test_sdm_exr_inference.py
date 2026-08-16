@@ -1049,6 +1049,9 @@ class SdmExrInferenceTests(unittest.TestCase):
             provenance["selection_manifest_sha256"],
             sha256_file(config.effective_selection_manifest_path),
         )
+        self.assertEqual(
+            provenance["gt_validity_policy"], "sdm_corrected_v2_unit_band"
+        )
 
     def test_model_batch_does_not_gain_ground_truth_during_device_transfer(self):
         self.make_dataset("alpha.data")

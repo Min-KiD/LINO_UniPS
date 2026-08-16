@@ -12,7 +12,12 @@ import numpy as np
 from .config import SdmExrInferenceConfig
 from .exr_io import read_file_bytes, read_mask_exr_bytes, read_rgb_exr_bytes
 from .manifest import DatasetManifest, ObjectRecord
-from .metrics import angular_metrics, load_source_gt, normal_validity_mask
+from .metrics import (
+    GT_VALIDITY_POLICY,
+    angular_metrics,
+    load_source_gt,
+    normal_validity_mask,
+)
 from .provenance import sha256_bytes
 
 
@@ -147,6 +152,7 @@ def preflight_transfer_sources(
             "source_geometry": {"height": geometry[0], "width": geometry[1]},
             "selected_observations": observation_stats,
             "decoded_gt_valid_pixel_count": gt_count,
+            "gt_validity_policy": GT_VALIDITY_POLICY,
             "external_mask_pixel_count": mask_count,
             "intersection_pixel_count": intersection_count,
             "gt_outside_mask_pixel_count": gt_outside_count,
