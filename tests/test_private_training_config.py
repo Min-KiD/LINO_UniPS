@@ -363,6 +363,28 @@ class PrivateTrainingConfigTests(unittest.TestCase):
                 raw[key] = value
                 load_private_train_config(self._write_yaml(raw))
 
+    def test_checked_in_lazy_presets_are_isolated_and_paired(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        config = load_private_train_config(
+            repo_root / "configs/lino_private_train_fixed.yaml"
+        )
+        self.assertEqual(
+            str(config.save_dir), "runs/lino_private_fixed_lazy_sdmvalid_bf16"
+        )
+        self.assertEqual(config.source_validation.mode, "lazy")
+        inference_yaml = (
+            repo_root / "configs/lino_private_infer_trained_fixed.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "runs/lino_private_fixed_lazy_sdmvalid_bf16/exports/"
+            "lino_epoch_100.pth",
+            inference_yaml,
+        )
+        self.assertIn(
+            'output_root: "./output/lino_private_trained_lazy_sdmvalid"',
+            inference_yaml,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

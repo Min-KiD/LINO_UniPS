@@ -1,7 +1,7 @@
 # SDM-EXR LINO–SDM Inference and Comparison Guide
 
 This guide covers the private LINO training workflow on the
-`dev-lino-private-training` branch and the released SDM-style EXR workflow
+`dev-lino-sdm-comparison` branch and the released SDM-style EXR workflow
 below. It starts with environment installation and
 ends with paired LINO/SDM angular-error results.
 
@@ -56,6 +56,22 @@ CUDA, AdamW, StepLR, and 100 total epochs. The command prints one line after
 each successfully published epoch. Do not treat a stopped or failed run as a
 completed experiment; the last valid `last.ckpt` remains the resume point.
 
+Startup uses a filename-only structural index. It checks safe object and file
+names but does not decode or hash the complete EXR dataset before CUDA is
+initialized. Each consumed sample then reads and validates exactly eight files:
+six epoch-selected observations, `local_normal.exr`, and `binary_mask.exr`.
+There is intentionally no cross-run content ledger, so changing bytes under an
+unchanged filename does not invalidate a resume fingerprint; those bytes are
+still validated when the sample is consumed.
+
+LINO derives GT support with the same `sdm_corrected_v2_unit_band` rule as the
+already-trained SDM corrected-v2 baseline: finite float32 normal length with
+`abs(length - 1) < 0.5`. Every such GT-valid pixel must remain inside the
+external mask, while external-mask-only halo is model context without target
+loss. Checkpoints and exports identify this workflow as
+`lino-private-exr-training-v2`. SDM does not require retraining for this
+LINO-only loading and validity correction.
+
 ### Resume from a full training checkpoint
 
 `.ckpt` is the only artifact that resumes optimizer, scheduler, epoch, best
@@ -72,7 +88,7 @@ Set these values in `/tmp/lino_private_train_resume.yaml`:
 ```yaml
 startup_mode: "resume"
 init_checkpoint: null
-resume_checkpoint: "./runs/lino_private_fixed_bf16/checkpoints/last.ckpt"
+resume_checkpoint: "./runs/lino_private_fixed_lazy_sdmvalid_bf16/checkpoints/last.ckpt"
 epochs: 100
 ```
 
@@ -119,7 +135,7 @@ before the live model or CUDA device is created.
 
 ### Artifacts and selection policy
 
-The primary run writes under `runs/lino_private_fixed_bf16/`:
+The primary run writes under `runs/lino_private_fixed_lazy_sdmvalid_bf16/`:
 
 ```text
 config.resolved.yaml       # resolved training settings
@@ -152,7 +168,7 @@ This validates the adjacent JSON sidecar, its checkpoint digest, architecture
 schema, preprocessing version, 256x256 source geometry, external-mask and
 unsigned-normal contract, and the exact 16-light manifest before constructing
 the model. It writes signed 256x256 predictions under
-`output/lino_private_trained_fixed/external/lino/` and prints elapsed time,
+`output/lino_private_trained_lazy_sdmvalid/external/lino/` and prints elapsed time,
 MAE, and CUDA memory. `run.json` is created only after every selected object
 finishes successfully; a missing `run.json` means the inference run is partial
 or failed. Do not create it manually.
@@ -258,7 +274,7 @@ PY
 ```bash
 cp configs/lino_private_train_fixed.yaml /tmp/lino_private_smoke.yaml
 sed -i \
-  -e 's#save_dir: "./runs/lino_private_fixed_bf16"#save_dir: "./runs/lino_private_smoke"#' \
+  -e 's#save_dir: "./runs/lino_private_fixed_lazy_sdmvalid_bf16"#save_dir: "./runs/lino_private_smoke"#' \
   -e 's#final_selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"#final_selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
   -e 's/epochs: 100/epochs: 1/' \
   /tmp/lino_private_smoke.yaml
@@ -293,10 +309,10 @@ contract:
 ```bash
 cp configs/lino_private_infer_trained_fixed.yaml /tmp/lino_private_smoke_infer.yaml
 sed -i \
-  -e 's#checkpoint: "./runs/lino_private_fixed_bf16/exports/lino_epoch_100.pth"#checkpoint: "./runs/lino_private_smoke/smoke/exports/lino_epoch_002.pth"#' \
+  -e 's#checkpoint: "./runs/lino_private_fixed_lazy_sdmvalid_bf16/exports/lino_epoch_100.pth"#checkpoint: "./runs/lino_private_smoke/smoke/exports/lino_epoch_002.pth"#' \
   -e 's#data_root: "/mnt/18TData/minhnv/inference"#data_root: "/mnt/18TData/minhnv/inference_smoke"#' \
   -e 's#selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"#selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
-  -e 's#output_root: "./output/lino_private_trained_fixed"#output_root: "./output/lino_private_smoke"#' \
+  -e 's#output_root: "./output/lino_private_trained_lazy_sdmvalid"#output_root: "./output/lino_private_smoke"#' \
   -e 's/require_checkpoint_data_contract: true/require_checkpoint_data_contract: true\nallow_non_comparable_checkpoint: true/' \
   /tmp/lino_private_smoke_infer.yaml
 python eval.py --config /tmp/lino_private_smoke_infer.yaml

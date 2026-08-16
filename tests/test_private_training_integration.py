@@ -236,7 +236,7 @@ class _InferenceStub:
 class PrivateTrainingDocumentationTests(unittest.TestCase):
     def test_operator_guide_contains_primary_commands(self):
         guide = (REPO_ROOT / "README_train_infer.md").read_text(encoding="utf-8")
-        self.assertIn("`dev-lino-private-training` branch", guide)
+        self.assertIn("`dev-lino-sdm-comparison` branch", guide)
         self.assertIn(
             "python train_private.py --config configs/lino_private_train_fixed.yaml",
             guide,
@@ -268,6 +268,10 @@ class PrivateTrainingDocumentationTests(unittest.TestCase):
         self.assertIn("exactly two object keys", guide)
         self.assertIn("exactly 16 unique light names", guide)
         self.assertIn("shutil.copytree", guide)
+        self.assertIn("sdm_corrected_v2_unit_band", guide)
+        self.assertIn("SDM does not require retraining", guide)
+        self.assertIn("eight files", guide)
+        self.assertIn("lino-private-exr-training-v2", guide)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 # Paired inference preset for a comparable epoch-100 private LINO export.
 # The .json sidecar next to checkpoint is mandatory and is validated strictly.
 
-checkpoint: "./runs/lino_private_fixed_bf16/exports/lino_epoch_100.pth"
+checkpoint: "./runs/lino_private_fixed_lazy_sdmvalid_bf16/exports/lino_epoch_100.pth"
 data_root: "/mnt/18TData/minhnv/inference"
-output_root: "./output/lino_private_trained_fixed"
+output_root: "./output/lino_private_trained_lazy_sdmvalid"
 object_suffix: ".data"
 image_prefix: "image"
 image_extension: ".exr"
