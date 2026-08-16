@@ -91,6 +91,7 @@ class PrivateTrainingIntegrationTests(unittest.TestCase):
             scheduler_gamma=0.5,
             save_every_epochs=1,
             keep_milestone_epochs=(1, 2),
+            activation_checkpointing=False,
         )
 
     def manifest_builder(self, _config: PrivateTrainConfig, split: str) -> PrivateSplitIndex:

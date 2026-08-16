@@ -81,6 +81,7 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
             "scheduler_gamma": 0.5,
             "save_every_epochs": 1,
             "keep_milestone_epochs": (1,),
+            "activation_checkpointing": False,
         }
         values.update(overrides)
         return PrivateTrainConfig(**values)  # type: ignore[arg-type]

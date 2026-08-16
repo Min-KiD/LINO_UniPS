@@ -24,6 +24,7 @@ from src.training.trainer import (
     _load_metric_rows,
     create_optimizer_scheduler,
     run_private_training,
+    train_epoch,
     validate_epoch,
 )
 
@@ -196,6 +197,7 @@ class PrivateTrainerTests(unittest.TestCase):
             scheduler_gamma=0.5,
             save_every_epochs=1,
             keep_milestone_epochs=(1, 2),
+            activation_checkpointing=False,
         )
 
     def manifests(self, _config, split):
@@ -337,6 +339,20 @@ class PrivateTrainerTests(unittest.TestCase):
             rows = list(csv.DictReader(stream))
         self.assertEqual([int(row["epoch"]) for row in rows], [1, 2])
 
+    def test_resume_rejects_activation_checkpointing_mode_change(self):
+        first = run_private_training(self.config(epochs=1), **self.dependencies())
+        changed = replace(
+            self.config(
+                epochs=2,
+                startup_mode="resume",
+                resume=first.last_checkpoint,
+            ),
+            activation_checkpointing=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "contract|config_snapshot"):
+            run_private_training(changed, **self.dependencies())
+
     def test_resume_metric_boundary_fails_before_live_model(self):
         first = run_private_training(self.config(epochs=1), **self.dependencies())
         (first.run_dir / "metrics.csv").unlink()
@@ -457,6 +473,45 @@ class PrivateTrainerTests(unittest.TestCase):
         self.assertEqual(optimizer.param_groups[0]["lr"], 0.01)
         self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.0)
         self.assertEqual(scheduler.step_size, 1)
+
+    def test_train_epoch_routes_activation_checkpointing_to_both_adapter_stages(self):
+        model = _TinyReleasedModel()
+        config = replace(self.config(epochs=1), activation_checkpointing=True)
+        optimizer, _scheduler = create_optimizer_scheduler(model, config)
+        sample = _sample("object.data")
+        batch = {
+            **{
+                key: value.unsqueeze(0)
+                for key, value in sample.items()
+                if isinstance(value, torch.Tensor)
+            },
+            "metadata": [sample["metadata"]],
+        }
+        trainer_module = __import__("src.training.trainer", fromlist=["train_epoch"])
+
+        with (
+            mock.patch(
+                "src.training.model_adapter.gauss_filter", return_value=nn.Identity()
+            ),
+            mock.patch(
+                "src.training.trainer.encode_private_batch",
+                wraps=trainer_module.encode_private_batch,
+            ) as encode,
+            mock.patch(
+                "src.training.trainer.decode_private_chunks",
+                wraps=trainer_module.decode_private_chunks,
+            ) as decode,
+        ):
+            train_epoch(
+                model,
+                [batch],
+                config,
+                optimizer=optimizer,
+                device=torch.device("cpu"),
+            )
+
+        self.assertTrue(encode.call_args.kwargs["activation_checkpointing"])
+        self.assertTrue(decode.call_args.kwargs["activation_checkpointing"])
 
 
 if __name__ == "__main__":

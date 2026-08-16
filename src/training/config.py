@@ -125,6 +125,7 @@ class PrivateTrainConfig:
     scheduler_gamma: float
     save_every_epochs: int
     keep_milestone_epochs: tuple[int, ...]
+    activation_checkpointing: bool
     source_validation: SourceValidationConfig = field(
         default_factory=SourceValidationConfig
     )
@@ -236,6 +237,8 @@ class PrivateTrainConfig:
             raise ValueError("device must be cuda, cpu, or auto")
         if not isinstance(self.deterministic, bool):
             raise ValueError("deterministic must be a boolean")
+        if not isinstance(self.activation_checkpointing, bool):
+            raise ValueError("activation_checkpointing must be a boolean")
 
         for field_name, minimum, strict in (
             ("learning_rate", 0.0, True),
@@ -400,6 +403,9 @@ def load_private_train_config(path: str | Path) -> PrivateTrainConfig:
         scheduler_gamma=_float_value(values["scheduler_gamma"], "scheduler_gamma"),
         save_every_epochs=int_field("save_every_epochs"),
         keep_milestone_epochs=_milestones(values["keep_milestone_epochs"]),
+        activation_checkpointing=_bool_value(
+            values["activation_checkpointing"], "activation_checkpointing"
+        ),
         source_validation=_source_validation(values["source_validation"]),
     )
 

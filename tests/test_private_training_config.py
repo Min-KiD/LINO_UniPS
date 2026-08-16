@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,6 +48,7 @@ class PrivateTrainingConfigTests(unittest.TestCase):
             "canonical_resolution": 256,
             "pixel_samples": 2048,
             "train_pixel_budget": 131072,
+            "activation_checkpointing": True,
             "precision": "bf16",
             "device": "cuda",
             "deterministic": True,
@@ -103,6 +105,7 @@ class PrivateTrainingConfigTests(unittest.TestCase):
             canonical_resolution=256,
             pixel_samples=2048,
             train_pixel_budget=131072,
+            activation_checkpointing=True,
             precision="bf16",
             device="cuda",
             deterministic=True,
@@ -148,6 +151,7 @@ class PrivateTrainingConfigTests(unittest.TestCase):
                 "canonical_resolution": 256,
                 "pixel_samples": 2048,
                 "train_pixel_budget": 131072,
+                "activation_checkpointing": True,
                 "precision": "bf16",
                 "device": "cuda",
                 "deterministic": True,
@@ -346,6 +350,36 @@ class PrivateTrainingConfigTests(unittest.TestCase):
         raw["epochs"] = True
         with self.assertRaisesRegex(ValueError, "epochs"):
             load_private_train_config(self._write_yaml(raw))
+
+    def test_activation_checkpointing_is_a_required_boolean(self):
+        raw = self.valid_mapping()
+        del raw["activation_checkpointing"]
+        with self.assertRaisesRegex(ValueError, "activation_checkpointing"):
+            load_private_train_config(self._write_yaml(raw))
+
+        for value in (0, 1, "true", None):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "activation_checkpointing.*boolean"
+            ):
+                raw = self.valid_mapping()
+                raw["activation_checkpointing"] = value
+                load_private_train_config(self._write_yaml(raw))
+
+        self.assertIs(
+            inspect.signature(PrivateTrainConfig).parameters[
+                "activation_checkpointing"
+            ].default,
+            inspect.Parameter.empty,
+        )
+
+    def test_fixed_private_preset_enables_activation_checkpointing(self):
+        preset = Path(__file__).resolve().parents[1] / "configs/lino_private_train_fixed.yaml"
+
+        config = load_private_train_config(preset)
+
+        self.assertTrue(config.activation_checkpointing)
+        self.assertEqual(config.train_batch_size, 1)
+        self.assertEqual(config.train_pixel_budget, 4096)
 
     def test_filenames_must_be_safe_basenames(self):
         for key, value in (

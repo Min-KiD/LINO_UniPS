@@ -263,8 +263,14 @@ def train_epoch(
                 observations,
                 model_mask,
                 canonical_resolution=config.canonical_resolution,
+                activation_checkpointing=config.activation_checkpointing,
             )
-            predictions = decode_private_chunks(model, encoded, chunks)
+            predictions = decode_private_chunks(
+                model,
+                encoded,
+                chunks,
+                activation_checkpointing=config.activation_checkpointing,
+            )
             loss = component_sse_batch(predictions, targets)
         if not torch.isfinite(loss).item():
             raise FloatingPointError("training loss is non-finite")

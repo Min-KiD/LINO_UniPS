@@ -65,6 +65,24 @@ CUDA, AdamW, StepLR, and 100 total epochs. The command prints one line after
 each successfully published epoch. Do not treat a stopped or failed run as a
 completed experiment; the last valid `last.ckpt` remains the resume point.
 
+The fixed preset also enables GPU activation checkpointing:
+
+```yaml
+train_batch_size: 1
+train_pixel_budget: 4096
+activation_checkpointing: true
+```
+
+This does not change LiNo_UniPS parameters, checkpoint keys, six-light input,
+or inference. During training it discards selected encoder, dense-GLC
+smoothing, and decoder activations, then recomputes them during backward. Peak
+CUDA memory should therefore decrease, while each epoch can take longer. It
+does not move activations to CPU. Resume binds this setting in the saved run
+contract, so changing it requires a new cold-start/initialization run rather
+than silently continuing an incompatible runtime contract. A successful first
+optimizer step on the target GPU is still required to establish whether the
+23 GiB device is large enough.
+
 Startup uses a filename-only structural index. It checks safe object and file
 names but does not decode or hash the complete EXR dataset before CUDA is
 initialized. Each consumed sample then reads and validates exactly eight files:

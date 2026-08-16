@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from src.models.utils.gauss_filter import gauss_filter
 
@@ -25,6 +26,14 @@ _EXPECTED_SIDE = 512
 _SMOOTHING_SIGMA = 1
 _SMOOTHING_SCALE = 10
 _DECODE_CHUNK = 16
+
+
+def _run_checkpointed(function, *args, enabled: bool):
+    if not isinstance(enabled, bool):
+        raise TypeError("activation_checkpointing must be a boolean")
+    if enabled and torch.is_grad_enabled():
+        return torch_checkpoint(function, *args, use_reentrant=False)
+    return function(*args)
 
 
 def _model_device(model: torch.nn.Module) -> torch.device | None:
@@ -155,14 +164,30 @@ def _validate_encoder_inputs(
     return batch, height, width
 
 
-def _smooth_glc(glc: torch.Tensor, height: int, canonical_resolution: int) -> torch.Tensor:
+def _smooth_glc(
+    glc: torch.Tensor,
+    height: int,
+    canonical_resolution: int,
+    *,
+    activation_checkpointing: bool = False,
+) -> torch.Tensor:
     f_scale = height // canonical_resolution
     kernel_size = _SMOOTHING_SCALE * f_scale + 1
     smoothing = gauss_filter(glc.shape[1], kernel_size, _SMOOTHING_SIGMA).to(
         device=glc.device,
         dtype=glc.dtype,
     )
-    smoothed = [smoothing(glc_chunk) for glc_chunk in torch.split(glc, _DECODE_CHUNK, dim=0)]
+    def _smooth_chunk(glc_chunk: torch.Tensor) -> torch.Tensor:
+        return smoothing(glc_chunk)
+
+    smoothed = [
+        _run_checkpointed(
+            _smooth_chunk,
+            glc_chunk,
+            enabled=activation_checkpointing,
+        )
+        for glc_chunk in torch.split(glc, _DECODE_CHUNK, dim=0)
+    ]
     result = torch.cat(smoothed, dim=0)
     _require_finite(result, "smoothed GLC")
     return result
@@ -173,6 +198,8 @@ def encode_private_batch(
     observations: torch.Tensor,
     model_mask: torch.Tensor,
     canonical_resolution: int = 256,
+    *,
+    activation_checkpointing: bool = False,
 ) -> EncodedPrivateBatch:
     """Encode six masked observations per object with the released image encoder."""
 
@@ -190,10 +217,24 @@ def encode_private_batch(
     )
     with _released_dtype_bridge(model, encoder_input.device) as bridge_dtype:
         released_input = encoder_input if bridge_dtype is None else encoder_input.to(bridge_dtype)
-        encoder_output = model.image_encoder(released_input, light_counts, int(canonical_resolution))
-    if not isinstance(encoder_output, (tuple, list)) or not encoder_output:
-        raise TypeError("released image_encoder must return GLC features and auxiliary tokens")
-    glc = _require_tensor(encoder_output[0], "image_encoder GLC output")
+
+        def _encode_glc(images: torch.Tensor) -> torch.Tensor:
+            encoder_output = model.image_encoder(
+                images,
+                light_counts,
+                int(canonical_resolution),
+            )
+            if not isinstance(encoder_output, (tuple, list)) or not encoder_output:
+                raise TypeError(
+                    "released image_encoder must return GLC features and auxiliary tokens"
+                )
+            return _require_tensor(encoder_output[0], "image_encoder GLC output")
+
+        glc = _run_checkpointed(
+            _encode_glc,
+            released_input,
+            enabled=activation_checkpointing,
+        )
     if glc.ndim != 4:
         raise ValueError("image_encoder GLC output must have shape [B*6, C, H, W]")
     if glc.shape[0] != batch * _EXPECTED_LIGHTS or tuple(glc.shape[-2:]) != (height, width):
@@ -201,7 +242,12 @@ def encode_private_batch(
     if glc.shape[1] <= 0:
         raise ValueError("image_encoder GLC output must have channels")
     _require_finite(glc, "image_encoder GLC output")
-    glc = _smooth_glc(glc, height, int(canonical_resolution))
+    glc = _smooth_glc(
+        glc,
+        height,
+        int(canonical_resolution),
+        activation_checkpointing=activation_checkpointing,
+    )
     return EncodedPrivateBatch(
         observations=observations,
         glc=glc,
@@ -287,49 +333,66 @@ def _decode_one_chunk(
     object_observations: torch.Tensor,
     object_glc: torch.Tensor,
     indices: torch.Tensor,
+    *,
+    activation_checkpointing: bool = False,
 ) -> DecodedNormalChunk:
     device_indices = indices.to(device=object_observations.device, dtype=torch.long)
-    observation_pixels = object_observations[device_indices]
-    glc_pixels = object_glc[device_indices]
     if not indices.numel():
         raise ValueError("trusted index chunks must be nonempty")
-    _require_finite(observation_pixels, "observation pixels")
-    _require_finite(glc_pixels, "GLC pixels")
-    with _released_dtype_bridge(model, object_observations.device) as bridge_dtype:
-        if bridge_dtype is None:
-            released_observations = observation_pixels
-            released_glc = glc_pixels
-        else:
-            released_observations = observation_pixels.to(bridge_dtype)
-            released_glc = glc_pixels.to(bridge_dtype)
-        embedded = model.img_embedding(released_observations)
-        if not isinstance(embedded, torch.Tensor):
-            raise TypeError("img_embedding must return a tensor")
-        _require_finite(embedded, "embedded observation pixels")
-        features = embedded + released_glc
-        _require_finite(features, "embedded plus GLC features")
-        features = model.glc_upsample(features)
-        if not isinstance(features, torch.Tensor):
-            raise TypeError("glc_upsample must return a tensor")
-        _require_finite(features, "upsampled GLC features")
-        features = embedded + features
-        _require_finite(features, "residual GLC features")
-        features = model.glc_aggregation(features)
-        if not isinstance(features, torch.Tensor):
-            raise TypeError("glc_aggregation must return a tensor")
-        _require_finite(features, "aggregated GLC features")
-        regressor_output = model.regressor(features, len(device_indices))
-        if not isinstance(regressor_output, (tuple, list)) or not regressor_output:
-            raise TypeError("released regressor must return normal and auxiliary outputs")
-        raw_normal = _require_tensor(regressor_output[0], "regressor normal output")
-        _require_finite(raw_normal, "regressor normal output")
-        for auxiliary_number, auxiliary in enumerate(regressor_output[1:], start=1):
-            if isinstance(auxiliary, torch.Tensor):
-                _require_finite(auxiliary, f"regressor auxiliary output {auxiliary_number}")
-        prediction = F.normalize(raw_normal.reshape(-1, 3), p=2, dim=-1, eps=1.0e-6)
-        if prediction.shape != (indices.numel(), 3):
-            raise ValueError("regressor normal output does not match trusted index count")
-        _require_finite(prediction, "normal prediction")
+
+    def _decode_chunk_tensor(
+        observations: torch.Tensor,
+        glc: torch.Tensor,
+        selected_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        observation_pixels = observations[selected_indices]
+        glc_pixels = glc[selected_indices]
+        _require_finite(observation_pixels, "observation pixels")
+        _require_finite(glc_pixels, "GLC pixels")
+        with _released_dtype_bridge(model, observations.device) as bridge_dtype:
+            if bridge_dtype is None:
+                released_observations = observation_pixels
+                released_glc = glc_pixels
+            else:
+                released_observations = observation_pixels.to(bridge_dtype)
+                released_glc = glc_pixels.to(bridge_dtype)
+            embedded = model.img_embedding(released_observations)
+            if not isinstance(embedded, torch.Tensor):
+                raise TypeError("img_embedding must return a tensor")
+            _require_finite(embedded, "embedded observation pixels")
+            features = embedded + released_glc
+            _require_finite(features, "embedded plus GLC features")
+            features = model.glc_upsample(features)
+            if not isinstance(features, torch.Tensor):
+                raise TypeError("glc_upsample must return a tensor")
+            _require_finite(features, "upsampled GLC features")
+            features = embedded + features
+            _require_finite(features, "residual GLC features")
+            features = model.glc_aggregation(features)
+            if not isinstance(features, torch.Tensor):
+                raise TypeError("glc_aggregation must return a tensor")
+            _require_finite(features, "aggregated GLC features")
+            regressor_output = model.regressor(features, len(selected_indices))
+            if not isinstance(regressor_output, (tuple, list)) or not regressor_output:
+                raise TypeError("released regressor must return normal and auxiliary outputs")
+            raw_normal = _require_tensor(regressor_output[0], "regressor normal output")
+            _require_finite(raw_normal, "regressor normal output")
+            for auxiliary_number, auxiliary in enumerate(regressor_output[1:], start=1):
+                if isinstance(auxiliary, torch.Tensor):
+                    _require_finite(auxiliary, f"regressor auxiliary output {auxiliary_number}")
+            prediction = F.normalize(raw_normal.reshape(-1, 3), p=2, dim=-1, eps=1.0e-6)
+            if prediction.shape != (selected_indices.numel(), 3):
+                raise ValueError("regressor normal output does not match trusted index count")
+            _require_finite(prediction, "normal prediction")
+            return prediction
+
+    prediction = _run_checkpointed(
+        _decode_chunk_tensor,
+        object_observations,
+        object_glc,
+        device_indices,
+        enabled=activation_checkpointing,
+    )
     return DecodedNormalChunk(indices=device_indices, prediction=prediction)
 
 
@@ -337,6 +400,8 @@ def decode_private_chunks(
     model: torch.nn.Module,
     encoded: EncodedPrivateBatch,
     index_chunks: Sequence[Sequence[torch.Tensor]],
+    *,
+    activation_checkpointing: bool = False,
 ) -> tuple[tuple[DecodedNormalChunk, ...], ...]:
     """Decode trusted pixel chunks through the released normal-prediction chain."""
 
@@ -355,7 +420,13 @@ def decode_private_chunks(
         )
         decoded.append(
             tuple(
-                _decode_one_chunk(model, object_observations, object_glc, indices)
+                _decode_one_chunk(
+                    model,
+                    object_observations,
+                    object_glc,
+                    indices,
+                    activation_checkpointing=activation_checkpointing,
+                )
                 for indices in object_chunks
             )
         )

@@ -223,6 +223,116 @@ class PrivateModelAdapterTests(unittest.TestCase):
         for name in ("image_encoder", "img_embedding", "glc_upsample", "glc_aggregation", "regressor"):
             self.assertTrue(any(parameter.grad is not None for parameter in getattr(model, name).parameters()))
 
+    def test_activation_checkpointing_routes_encoder_smoothing_and_decoder_chunks(self):
+        model = _FakeReleasedLino()
+        images = self.images()[:1]
+        mask = self.model_mask()[:1]
+        calls = []
+
+        def recording_checkpoint(function, *args, **kwargs):
+            calls.append((function.__name__, kwargs))
+            return function(*args)
+
+        with (
+            mock.patch("src.training.model_adapter.gauss_filter", return_value=nn.Identity()),
+            mock.patch(
+                "src.training.model_adapter.torch_checkpoint",
+                side_effect=recording_checkpoint,
+            ),
+        ):
+            encoded = encode_private_batch(
+                model,
+                images,
+                mask,
+                canonical_resolution=256,
+                activation_checkpointing=True,
+            )
+            decode_private_chunks(
+                model,
+                encoded,
+                ((torch.tensor([0, 1]), torch.tensor([2, 3])),),
+                activation_checkpointing=True,
+            )
+
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            ["_encode_glc", "_smooth_chunk", "_decode_chunk_tensor", "_decode_chunk_tensor"],
+        )
+        self.assertTrue(all(kwargs == {"use_reentrant": False} for _name, kwargs in calls))
+
+    def test_activation_checkpointing_preserves_predictions_gradients_and_state_schema(self):
+        reference = _FakeReleasedLino()
+        initial_state = {
+            name: value.detach().clone() for name, value in reference.state_dict().items()
+        }
+
+        def run(enabled):
+            model = _FakeReleasedLino()
+            model.load_state_dict(initial_state, strict=True)
+            before = released_state_schema(model)
+            with mock.patch(
+                "src.training.model_adapter.gauss_filter", return_value=nn.Identity()
+            ):
+                encoded = encode_private_batch(
+                    model,
+                    self.images()[:1],
+                    self.model_mask()[:1],
+                    canonical_resolution=256,
+                    activation_checkpointing=enabled,
+                )
+                decoded = decode_private_chunks(
+                    model,
+                    encoded,
+                    ((torch.tensor([0, 1, 2, 3]),),),
+                    activation_checkpointing=enabled,
+                )
+                prediction = decoded[0][0].prediction
+                weights = torch.tensor([0.5, -0.25, 1.25], dtype=prediction.dtype)
+                (prediction * weights).sum().backward()
+            gradients = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            }
+            return prediction.detach(), gradients, before, released_state_schema(model)
+
+        plain = run(False)
+        checkpointed = run(True)
+
+        self.assertTrue(torch.allclose(plain[0], checkpointed[0], atol=1.0e-6, rtol=1.0e-5))
+        self.assertEqual(plain[1].keys(), checkpointed[1].keys())
+        for name in plain[1]:
+            self.assertTrue(
+                torch.allclose(plain[1][name], checkpointed[1][name], atol=1.0e-6, rtol=1.0e-5),
+                name,
+            )
+        self.assertEqual(plain[2], plain[3])
+        self.assertEqual(checkpointed[2], checkpointed[3])
+        self.assertEqual(plain[2], checkpointed[2])
+
+    def test_activation_checkpointing_is_bypassed_when_gradients_are_disabled(self):
+        model = _FakeReleasedLino()
+        with (
+            torch.no_grad(),
+            mock.patch("src.training.model_adapter.gauss_filter", return_value=nn.Identity()),
+            mock.patch("src.training.model_adapter.torch_checkpoint") as checkpoint,
+        ):
+            encoded = encode_private_batch(
+                model,
+                self.images()[:1],
+                self.model_mask()[:1],
+                canonical_resolution=256,
+                activation_checkpointing=True,
+            )
+            decode_private_chunks(
+                model,
+                encoded,
+                ((torch.tensor([0, 1]),),),
+                activation_checkpointing=True,
+            )
+
+        checkpoint.assert_not_called()
+
     def test_adapter_signature_has_no_ground_truth_argument(self):
         self.assertNotIn("target_normal", inspect.signature(encode_private_batch).parameters)
         self.assertNotIn("target_normal", inspect.signature(decode_private_chunks).parameters)

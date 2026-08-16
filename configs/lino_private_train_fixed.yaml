@@ -24,12 +24,13 @@ preprocessing_version: "private_external_lino_native_v1"
 max_image_resolution: 512
 canonical_resolution: 256
 pixel_samples: 2048
-train_pixel_budget: 10240
+train_pixel_budget: 4096
+activation_checkpointing: true # Recompute GPU activations in backward to reduce peak VRAM.
 precision: "bf16"
 device: "cuda"
 deterministic: false
 epochs: 100
-train_batch_size: 2
+train_batch_size: 1
 train_workers: 8
 test_workers: 4
 learning_rate: 0.00005
