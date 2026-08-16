@@ -7,9 +7,9 @@ output_root: "./output/lino_private_transfer_fixed"
 object_suffix: ".data"
 image_prefix: "image"
 image_extension: ".exr"
-max_image_num: 16
+max_image_num: 6
 light_selection: "manifest"
-selection_manifest: "./output/sdm_lino_comparison/external/selected_lights.json"
+selection_manifest: "/mnt/16TData/minhnv/LINO/output/lino_private_transfer/external/selected_lights.json"
 seed: 20260710
 mask_policy: "external"
 external_mask_filename: "binary_mask.exr"
