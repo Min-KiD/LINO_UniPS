@@ -61,7 +61,7 @@ _LINEAR_METRIC_NAMES = (
     "accuracy_30",
     "accuracy_45",
 )
-_PRIVATE_SOURCE_REVISION = "lino-private-exr-training-v1"
+_PRIVATE_SOURCE_REVISION = "lino-private-exr-training-v2"
 
 
 def _normal_array(value: Any, *, label: str) -> np.ndarray:
@@ -617,6 +617,7 @@ def _validate_strict_lino_runtime_provenance(
         "architecture_schema_sha256",
         "checkpoint_sidecar_path",
         "checkpoint_sidecar_sha256",
+        "gt_validity_policy",
     )
     for field in required:
         if field not in payload:
@@ -629,6 +630,8 @@ def _validate_strict_lino_runtime_provenance(
         raise ValueError(
             "strict LINO run provenance source_revision does not match the approved private revision"
         )
+    if payload.get("gt_validity_policy") != GT_VALIDITY_POLICY:
+        raise ValueError("strict LINO run provenance GT validity policy is invalid")
     architecture = _valid_sha256_text(
         payload.get("architecture_schema_sha256"),
         label="strict LINO run provenance architecture_schema_sha256",
@@ -664,6 +667,8 @@ def _validate_strict_lino_runtime_provenance(
         raise ValueError("strict LINO checkpoint sidecar comparable must be true")
     if sidecar_metadata.get("source_revision") != _PRIVATE_SOURCE_REVISION:
         raise ValueError("strict LINO checkpoint sidecar source_revision is invalid")
+    if sidecar_metadata.get("gt_validity_policy") != GT_VALIDITY_POLICY:
+        raise ValueError("strict LINO checkpoint sidecar GT validity policy is invalid")
     sidecar_architecture = _valid_sha256_text(
         sidecar_metadata.get("architecture_schema_sha256"),
         label="strict LINO checkpoint sidecar architecture_schema_sha256",
@@ -682,6 +687,8 @@ def _validate_strict_lino_runtime_provenance(
         raise ValueError("strict LINO sidecar data_contract comparable must be true")
     if contract.get("source_revision") != _PRIVATE_SOURCE_REVISION:
         raise ValueError("strict LINO sidecar data_contract source_revision is invalid")
+    if contract.get("gt_validity_policy") != GT_VALIDITY_POLICY:
+        raise ValueError("strict LINO sidecar data_contract GT validity policy is invalid")
     contract_architecture = _valid_sha256_text(
         contract.get("architecture_schema_sha256"),
         label="strict LINO sidecar data_contract architecture_schema_sha256",

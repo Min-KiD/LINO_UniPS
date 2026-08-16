@@ -363,13 +363,15 @@ class ComparisonMetricsTests(unittest.TestCase):
             "artifact_kind": "lino_private_inference_weights",
             "checkpoint_sha256": checkpoint_digest,
             "architecture_schema_sha256": architecture,
-            "source_revision": "lino-private-exr-training-v1",
+            "source_revision": "lino-private-exr-training-v2",
+            "gt_validity_policy": "sdm_corrected_v2_unit_band",
             "run_kind": "experiment",
             "comparable": True,
             "data_contract": {
                 "artifact_kind": "lino_private_training_contract",
                 "architecture_schema_sha256": architecture,
-                "source_revision": "lino-private-exr-training-v1",
+                "source_revision": "lino-private-exr-training-v2",
+                "gt_validity_policy": "sdm_corrected_v2_unit_band",
                 "run_kind": "experiment",
                 "comparable": True,
             },
@@ -394,7 +396,8 @@ class ComparisonMetricsTests(unittest.TestCase):
             },
             "run_kind": "experiment",
             "comparable": True,
-            "source_revision": "lino-private-exr-training-v1",
+            "source_revision": "lino-private-exr-training-v2",
+            "gt_validity_policy": "sdm_corrected_v2_unit_band",
             "architecture_schema_sha256": architecture,
         }
         return config, config_path, payload, sidecar

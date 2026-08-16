@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import contextlib
+from io import StringIO
 import tempfile
 import unittest
 import weakref
@@ -17,7 +18,7 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from src.training.config import PrivateTrainConfig
-from src.training.private_manifest import PrivateObjectRecord, PrivateSplitManifest
+from src.training.private_manifest import PrivateSourceIndexRecord, PrivateSplitIndex
 from src.training.trainer import (
     _load_metric_rows,
     create_optimizer_scheduler,
@@ -198,29 +199,38 @@ class PrivateTrainerTests(unittest.TestCase):
 
     def manifests(self, _config, split):
         name = "object.data"
-        record = PrivateObjectRecord(
+        record = PrivateSourceIndexRecord(
             name=name,
             relative_dir=name,
             height=256,
             width=256,
             observation_files=tuple(f"image{i:03d}.exr" for i in range(16)),
-            observation_sha256=tuple(f"hash-{i}" for i in range(16)),
             normal_file="local_normal.exr",
-            normal_sha256="normal-hash",
             mask_file="binary_mask.exr",
-            mask_sha256="mask-hash",
-            gt_valid_pixels=1,
-            mask_valid_pixels=1,
-            mask_only_pixels=0,
         )
-        return PrivateSplitManifest(1, split, str(self.train_root if split == "train" else self.test_root), (record,))
+        return PrivateSplitIndex(
+            2,
+            split,
+            str(self.train_root if split == "train" else self.test_root),
+            (record,),
+            "private_exr_index_v1",
+            ".data",
+            "image",
+            ".exr",
+            "unsigned",
+            (256, 256),
+            "external",
+            6,
+            "seeded",
+            20260710,
+        )
 
     def datasets(self, _config, manifest, *, split):
         return _TinyDataset([_sample(record.name) for record in manifest.objects], split=split)
 
     def dependencies(self):
         return {
-            "manifest_builder": self.manifests,
+            "index_builder": self.manifests,
             "dataset_factory": self.datasets,
             "model_factory": _TinyReleasedModel,
             "schema_provider": lambda: (("scale", (), "torch.float32"),),
@@ -230,7 +240,7 @@ class PrivateTrainerTests(unittest.TestCase):
         events = []
 
         def manifest_builder(config, split):
-            events.append(f"preflight:{split}")
+            events.append(f"index:{split}")
             return self.manifests(config, split)
 
         class ModelCreated(RuntimeError):
@@ -244,10 +254,53 @@ class PrivateTrainerTests(unittest.TestCase):
             run_private_training(
                 self.config(epochs=1),
                 model_factory=model_factory,
-                manifest_builder=manifest_builder,
+                index_builder=manifest_builder,
                 schema_provider=lambda: (("scale", (), "torch.float32"),),
             )
-        self.assertEqual(events, ["preflight:train", "preflight:test", "model"])
+        self.assertEqual(events, ["index:train", "index:test", "model"])
+
+    def test_indexing_precedes_device_and_first_lazy_source_read_is_reported(self):
+        events: list[str] = []
+
+        def index_builder(config, split):
+            events.append(f"{split}_index")
+            return self.manifests(config, split)
+
+        class ReadMarkedDataset(_TinyDataset):
+            def __getitem__(self, index):
+                events.append("first_source_read")
+                return super().__getitem__(index)
+
+        def dataset_factory(_config, index, *, split):
+            return ReadMarkedDataset(
+                [_sample(record.name) for record in index.objects], split=split
+            )
+
+        stdout = StringIO()
+        with contextlib.redirect_stdout(stdout):
+            run_private_training(
+                self.config(epochs=1),
+                index_builder=index_builder,
+                dataset_factory=dataset_factory,
+                model_factory=_TinyReleasedModel,
+                schema_provider=lambda: (("scale", (), "torch.float32"),),
+                device_resolver=lambda _value: (
+                    events.append("device") or torch.device("cpu")
+                ),
+            )
+
+        self.assertLess(events.index("train_index"), events.index("device"))
+        self.assertLess(events.index("test_index"), events.index("device"))
+        self.assertLess(events.index("device"), events.index("first_source_read"))
+        output = stdout.getvalue()
+        self.assertIn("content validation: lazy", output)
+        self.assertIn("First training batch ready after", output)
+        self.assertIn("Total training time:", output)
+        contract = json.loads((self.save_dir / "data_contract.json").read_text())
+        self.assertEqual(contract["source_revision"], "lino-private-exr-training-v2")
+        self.assertEqual(
+            contract["gt_validity_policy"], "sdm_corrected_v2_unit_band"
+        )
 
     def test_two_epoch_cold_start_writes_metrics_last_best_and_raw_exports(self):
         summary = run_private_training(self.config(epochs=2), **self.dependencies())
@@ -284,7 +337,7 @@ class PrivateTrainerTests(unittest.TestCase):
             run_private_training(
                 self.config(epochs=2, startup_mode="resume", resume=first.last_checkpoint),
                 model_factory=model_factory,
-                manifest_builder=self.manifests,
+                index_builder=self.manifests,
                 schema_provider=lambda: (("scale", (), "torch.float32"),),
                 device_resolver=lambda value: events.append(value),
             )
@@ -381,7 +434,7 @@ class PrivateTrainerTests(unittest.TestCase):
                 schema_provider=lambda: (("scale", (), "torch.float32"),),
                 model_factory=lambda: events.append("live_model"),
                 device_resolver=lambda *_: events.append("cuda"),
-                manifest_builder=self.manifests,
+                index_builder=self.manifests,
             )
         self.assertEqual(events, [])
 

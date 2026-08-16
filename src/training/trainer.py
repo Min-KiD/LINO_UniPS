@@ -27,7 +27,8 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from src.comparison.metrics import angular_metrics
+from src.comparison.metrics import GT_VALIDITY_POLICY, angular_metrics
+from src.comparison.reporting import format_clock_duration
 from src.data.lino_native_preprocessing import restore_lino_prediction
 from src.data.private_exr_train import PrivateExrTrainDataset, collate_private_exr
 from src.training.checkpointing import (
@@ -52,9 +53,9 @@ from src.training.objective import (
     sampled_angular_mae,
 )
 from src.training.private_manifest import (
-    PrivateSplitManifest,
-    build_private_split_manifest,
-    private_manifest_sha256,
+    PrivateSplitIndex,
+    build_private_split_index,
+    private_index_sha256,
 )
 from src.training.reproducibility import (
     epoch_permutation,
@@ -217,6 +218,7 @@ def train_epoch(
     epoch: int = 0,
     global_step: int = 0,
     clock: Callable[[], float] = time.perf_counter,
+    first_batch_callback: Callable[[], None] | None = None,
 ) -> tuple[_SplitStats, int]:
     """Run one target-mask-only training epoch and return object-weighted stats."""
 
@@ -227,7 +229,12 @@ def train_epoch(
     total_mae = 0.0
     total_objects = 0
     started = clock()
+    first_batch_reported = False
     for batch in train_loader:
+        if not first_batch_reported:
+            first_batch_reported = True
+            if first_batch_callback is not None:
+                first_batch_callback()
         if not isinstance(batch, Mapping):
             raise ValueError("private training batch must be a mapping")
         batch = _move_batch(batch, device)
@@ -576,7 +583,7 @@ def run_private_training(
     schema_provider: Callable[[], Sequence[tuple[str, Sequence[int], str]]] | None = None,
     model_factory: Callable[[], torch.nn.Module] | None = None,
     device_resolver: Callable[[str], torch.device] = resolve_device,
-    manifest_builder: Callable[[PrivateTrainConfig, str], PrivateSplitManifest] = build_private_split_manifest,
+    index_builder: Callable[[PrivateTrainConfig, str], PrivateSplitIndex] = build_private_split_index,
     dataset_factory: Callable[..., Dataset] = PrivateExrTrainDataset,
     source_predictor: Callable[..., Any] | None = None,
     clock: Callable[[], float] = time.perf_counter,
@@ -585,23 +592,36 @@ def run_private_training(
 
     if not isinstance(config, PrivateTrainConfig):
         raise TypeError("config must be a PrivateTrainConfig")
+    run_started = clock()
     seed_everything(config.seed, config.deterministic)
-    train_manifest = manifest_builder(config, "train")
-    test_manifest = manifest_builder(config, "test")
-    if not isinstance(train_manifest, PrivateSplitManifest) or not isinstance(test_manifest, PrivateSplitManifest):
-        raise TypeError("manifest_builder must return PrivateSplitManifest values")
+    indexes: dict[str, PrivateSplitIndex] = {}
+    for split, root in (("train", config.train_dir), ("test", config.test_dir)):
+        index_started = clock()
+        print(f"Indexing {root}")
+        index = index_builder(config, split)
+        if not isinstance(index, PrivateSplitIndex):
+            raise TypeError("index_builder must return PrivateSplitIndex values")
+        indexes[split] = index
+        elapsed = float(clock() - index_started)
+        print(
+            f"Indexed {len(index.objects)} objects in "
+            f"{format_clock_duration(elapsed)} (content validation: lazy)"
+        )
+    train_manifest = indexes["train"]
+    test_manifest = indexes["test"]
     final_digest = _read_final_selection(config.final_selection_manifest)
     schema_provider = schema_provider or (lambda: _production_schema_provider(config))
     expected_schema = tuple(schema_provider())
     architecture_digest = schema_fingerprint(expected_schema)
-    source_revision = "lino-private-exr-training-v1"
+    source_revision = "lino-private-exr-training-v2"
     contract = build_run_contract(
         config,
         architecture_schema=expected_schema,
-        train_manifest_sha256=private_manifest_sha256(train_manifest),
-        test_manifest_sha256=private_manifest_sha256(test_manifest),
+        train_manifest_sha256=private_index_sha256(train_manifest),
+        test_manifest_sha256=private_index_sha256(test_manifest),
         final_selection_manifest_sha256=final_digest,
         source_revision=source_revision,
+        gt_validity_policy=GT_VALIDITY_POLICY,
         runtime_versions=_runtime_versions(),
         run_kind="smoke" if smoke else "experiment",
         comparable=not smoke,
@@ -676,6 +696,17 @@ def run_private_training(
         test_dataset = Subset(test_dataset, test_indices)
     rows = list(existing_rows)
     final_export = run_dir / "exports" / f"lino_epoch_{progress_epoch:03d}.pth"
+    first_batch_reported = False
+
+    def report_first_batch() -> None:
+        nonlocal first_batch_reported
+        if not first_batch_reported:
+            first_batch_reported = True
+            print(
+                "First training batch ready after "
+                f"{format_clock_duration(float(clock() - run_started))}"
+            )
+
     for epoch_index in range(progress_epoch, config.epochs):
         logical_epoch = epoch_index
         if hasattr(train_dataset, "dataset"):
@@ -717,6 +748,7 @@ def run_private_training(
             epoch=logical_epoch,
             global_step=global_step,
             clock=clock,
+            first_batch_callback=report_first_batch,
         )
         validation = validate_epoch(model, test_loader, config, source_predictor=source_predictor, device=device)
         scheduler.step()
@@ -750,6 +782,7 @@ def run_private_training(
                     "data_contract": contract,
                     "preprocessing_version": config.preprocessing_version,
                     "source_revision": source_revision,
+                    "gt_validity_policy": GT_VALIDITY_POLICY,
                     "architecture_schema_sha256": architecture_digest,
                     "run_kind": "smoke" if smoke else "experiment",
                     "comparable": not smoke,
@@ -809,6 +842,10 @@ def run_private_training(
         )
     if progress_epoch == config.epochs:
         final_export = run_dir / "exports" / f"lino_epoch_{progress_epoch:03d}.pth"
+    print(
+        "Total training time: "
+        f"{format_clock_duration(float(clock() - run_started))}"
+    )
     return TrainingSummary(
         run_dir=run_dir,
         last_checkpoint=run_dir / "checkpoints" / "last.ckpt",

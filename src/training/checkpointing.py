@@ -126,6 +126,8 @@ def _as_mapping(value: object, label: str) -> Mapping[str, object]:
 
 
 def _json_safe(value: object) -> object:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_safe(asdict(value))
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
@@ -602,6 +604,7 @@ _REQUIRED_CONTRACT_KEYS = frozenset(
         "test_manifest_sha256",
         "final_selection_manifest_sha256",
         "source_revision",
+        "gt_validity_policy",
         "runtime_versions",
         "config_snapshot",
     }
@@ -632,6 +635,7 @@ def _validate_run_contract(value: object) -> Mapping[str, object]:
         "test_manifest_sha256",
         "final_selection_manifest_sha256",
         "source_revision",
+        "gt_validity_policy",
     ):
         if not isinstance(contract[key], str) or not contract[key]:
             raise ValueError(f"run_contract {key} must be a non-empty string")
@@ -752,6 +756,7 @@ def build_run_contract(
     test_manifest_sha256: str | None = None,
     final_selection_manifest_sha256: str | None = None,
     source_revision: str | None = None,
+    gt_validity_policy: str | None = None,
     runtime_versions: Mapping[str, object] | None = None,
     run_kind: str = "experiment",
     comparable: bool | None = None,
@@ -805,6 +810,8 @@ def build_run_contract(
         contract["final_selection_manifest_sha256"] = str(final_selection_manifest_sha256)
     if source_revision is not None:
         contract["source_revision"] = str(source_revision)
+    if gt_validity_policy is not None:
+        contract["gt_validity_policy"] = str(gt_validity_policy)
     if runtime_versions is not None:
         contract["runtime_versions"] = _json_safe(runtime_versions)
     return {str(key): _json_safe(value) for key, value in contract.items()}

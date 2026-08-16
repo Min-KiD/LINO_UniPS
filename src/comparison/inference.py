@@ -68,7 +68,7 @@ ModelLoader = Callable[[SdmExrInferenceConfig, torch.device], Any]
 DatasetFactory = Callable[[SdmExrInferenceConfig, DatasetManifest], Any]
 
 
-_PRIVATE_SOURCE_REVISION = "lino-private-exr-training-v1"
+_PRIVATE_SOURCE_REVISION = "lino-private-exr-training-v2"
 
 
 def _precision_dtype(config: SdmExrInferenceConfig) -> torch.dtype:
@@ -252,6 +252,10 @@ def _validate_trained_export_sidecar(
         raise ValueError(
             "LINO sidecar source_revision does not match the approved private training revision"
         )
+    if metadata.get("gt_validity_policy") != GT_VALIDITY_POLICY:
+        raise ValueError("LINO checkpoint sidecar GT validity policy is invalid")
+    if contract.get("gt_validity_policy") != GT_VALIDITY_POLICY:
+        raise ValueError("LINO sidecar data_contract GT validity policy is invalid")
     snapshot = _mapping(contract.get("config_snapshot"), label="LINO sidecar config_snapshot")
 
     expected_geometry = config.expected_source_geometry

@@ -65,6 +65,7 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
             "test_manifest_sha256": "test",
             "final_selection_manifest_sha256": "final",
             "source_revision": "source",
+            "gt_validity_policy": "sdm_corrected_v2_unit_band",
             "runtime_versions": {"python": "test"},
             "config_snapshot": {"seed": 7},
         }
@@ -409,6 +410,30 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
                 expected_contract=current,
+            )
+
+    def test_resume_rejects_previous_private_source_revision(self) -> None:
+        checkpoint = self.root / "revision-v1.ckpt"
+        old_contract = dict(self.contract)
+        old_contract["source_revision"] = "lino-private-exr-training-v1"
+        save_resume_checkpoint(
+            checkpoint,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            progress=TrainingProgress(0, 1, 0),
+            best=BestMetrics(float("inf"), float("inf"), 0),
+            contract=old_contract,
+        )
+        expected = dict(old_contract)
+        expected["source_revision"] = "lino-private-exr-training-v2"
+        with self.assertRaisesRegex(ValueError, "contract|fingerprint"):
+            load_resume_checkpoint(
+                checkpoint,
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                expected_contract=expected,
             )
 
     def test_resume_progress_cannot_exceed_saved_contract_total_epochs(self):

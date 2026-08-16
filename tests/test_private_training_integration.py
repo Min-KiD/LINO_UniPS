@@ -15,7 +15,7 @@ import torch
 from src.comparison.config import SdmExrInferenceConfig
 from src.comparison.inference import run_lino_inference
 from src.training.config import PrivateTrainConfig
-from src.training.private_manifest import PrivateObjectRecord, PrivateSplitManifest
+from src.training.private_manifest import PrivateSourceIndexRecord, PrivateSplitIndex
 from src.training.trainer import run_private_training
 from tests.comparison_helpers import write_mask_exr, write_rgb_exr
 from tests.test_private_trainer import _TinyDataset, _TinyReleasedModel, _sample
@@ -93,24 +93,22 @@ class PrivateTrainingIntegrationTests(unittest.TestCase):
             keep_milestone_epochs=(1, 2),
         )
 
-    def manifest_builder(self, _config: PrivateTrainConfig, split: str) -> PrivateSplitManifest:
-        record = PrivateObjectRecord(
+    def manifest_builder(self, _config: PrivateTrainConfig, split: str) -> PrivateSplitIndex:
+        record = PrivateSourceIndexRecord(
             name="object.data",
             relative_dir="object.data",
             height=256,
             width=256,
             observation_files=tuple(f"image{i:03d}.exr" for i in range(16)),
-            observation_sha256=tuple(f"hash-{i}" for i in range(16)),
             normal_file="local_normal.exr",
-            normal_sha256="normal-hash",
             mask_file="binary_mask.exr",
-            mask_sha256="mask-hash",
-            gt_valid_pixels=1,
-            mask_valid_pixels=1,
-            mask_only_pixels=0,
         )
         root = self.train_root if split == "train" else self.test_root
-        return PrivateSplitManifest(1, split, str(root), (record,))
+        return PrivateSplitIndex(
+            2, split, str(root), (record,), "private_exr_index_v1", ".data",
+            "image", ".exr", "unsigned", (256, 256), "external", 6,
+            "seeded", 20260710,
+        )
 
     @staticmethod
     def dataset_factory(_config, manifest, *, split):
@@ -124,7 +122,7 @@ class PrivateTrainingIntegrationTests(unittest.TestCase):
         return {
             "model_factory": _TinyReleasedModel,
             "schema_provider": lambda: (("scale", (), "torch.float32"),),
-            "manifest_builder": self.manifest_builder,
+            "index_builder": self.manifest_builder,
             "dataset_factory": self.dataset_factory,
             "source_predictor": self.source_predictor,
         }

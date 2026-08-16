@@ -160,7 +160,8 @@ class SdmExrInferenceTests(unittest.TestCase):
             "checkpoint_sha256": hashlib.sha256(self.checkpoint.read_bytes()).hexdigest(),
             "architecture_schema_sha256": schema,
             "preprocessing_version": "private_external_lino_native_v1",
-            "source_revision": "lino-private-exr-training-v1",
+            "source_revision": "lino-private-exr-training-v2",
+            "gt_validity_policy": "sdm_corrected_v2_unit_band",
             "run_kind": "experiment",
             "comparable": True,
             "data_contract": {
@@ -189,7 +190,8 @@ class SdmExrInferenceTests(unittest.TestCase):
                     "light_selection": "seeded",
                     "max_image_num": 6,
                 },
-                "source_revision": "lino-private-exr-training-v1",
+                "source_revision": "lino-private-exr-training-v2",
+                "gt_validity_policy": "sdm_corrected_v2_unit_band",
             },
         }
         if sidecar_overrides:
@@ -397,7 +399,7 @@ class SdmExrInferenceTests(unittest.TestCase):
         self.assertEqual(result["selected_light_count"], 16)
         self.assertEqual(result["run_kind"], "experiment")
         self.assertTrue(result["comparable"])
-        self.assertEqual(result["source_revision"], "lino-private-exr-training-v1")
+        self.assertEqual(result["source_revision"], "lino-private-exr-training-v2")
         self.assertEqual(
             result["architecture_schema_sha256"],
             inference._checkpoint_schema_fingerprint(config.checkpoint.read_bytes()),
