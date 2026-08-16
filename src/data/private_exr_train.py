@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.comparison.exr_io import read_mask_exr_bytes, read_rgb_exr_bytes
-from src.comparison.metrics import normal_validity_mask
+from src.comparison.metrics import GT_VALIDITY_POLICY, normal_validity_mask
 from src.comparison.normal_contract import decode_ground_truth_normal
 from src.data.lino_native_preprocessing import (
     normalize_lino_observations,
@@ -19,8 +19,8 @@ from src.data.lino_native_preprocessing import (
 )
 from src.training.config import PrivateTrainConfig
 from src.training.private_manifest import (
-    PrivateObjectRecord,
-    PrivateSplitManifest,
+    PrivateSourceIndexRecord,
+    PrivateSplitIndex,
     open_private_source_snapshot,
 )
 from src.training.reproducibility import select_observation_names
@@ -78,7 +78,9 @@ def _safe_basename(value: Any) -> bool:
     )
 
 
-def _finite_source_shape(record: PrivateObjectRecord, config: PrivateTrainConfig) -> tuple[int, int]:
+def _finite_source_shape(
+    record: PrivateSourceIndexRecord, config: PrivateTrainConfig
+) -> tuple[int, int]:
     expected = tuple(int(value) for value in config.expected_source_geometry)
     shape = (int(record.height), int(record.width))
     if shape != expected or any(value <= 0 for value in shape):
@@ -95,22 +97,22 @@ class PrivateExrTrainDataset(Dataset):
     def __init__(
         self,
         config: PrivateTrainConfig,
-        manifest: PrivateSplitManifest,
+        manifest: PrivateSplitIndex,
         *,
         split: str,
     ) -> None:
         if not isinstance(config, PrivateTrainConfig):
             raise TypeError("config must be a PrivateTrainConfig")
-        if not isinstance(manifest, PrivateSplitManifest):
-            raise TypeError("manifest must be a PrivateSplitManifest")
+        if not isinstance(manifest, PrivateSplitIndex):
+            raise TypeError("manifest must be a PrivateSplitIndex")
         if split not in {"train", "test"}:
             raise ValueError("split must be train or test")
         if manifest.split != split:
             raise ValueError(
                 f"manifest split does not match dataset split: {manifest.split!r} != {split!r}"
             )
-        if manifest.version != 1:
-            raise ValueError(f"unsupported private split manifest version: {manifest.version}")
+        if manifest.version != 2:
+            raise ValueError(f"unsupported private split index version: {manifest.version}")
 
         configured_root = config.train_dir if split == "train" else config.test_dir
         config_root = Path(configured_root).resolve(strict=False)
@@ -133,9 +135,11 @@ class PrivateExrTrainDataset(Dataset):
         for record in self.records:
             self._validate_record(record)
 
-    def _validate_record(self, record: PrivateObjectRecord) -> None:
-        if not isinstance(record, PrivateObjectRecord):
-            raise ValueError("manifest records must contain PrivateObjectRecord values")
+    def _validate_record(self, record: PrivateSourceIndexRecord) -> None:
+        if not isinstance(record, PrivateSourceIndexRecord):
+            raise ValueError(
+                "structural index records must contain PrivateSourceIndexRecord values"
+            )
         if not _safe_basename(record.name):
             raise ValueError(f"manifest object name is unsafe: {record.name!r}")
         if not isinstance(record.relative_dir, str) or record.relative_dir != record.name:
@@ -143,40 +147,31 @@ class PrivateExrTrainDataset(Dataset):
         _finite_source_shape(record, self.config)
 
         observations = record.observation_files
-        digests = record.observation_sha256
         if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
             raise ValueError(f"manifest observation_files must be a sequence for {record.name}")
-        if not isinstance(digests, Sequence) or isinstance(digests, (str, bytes)):
-            raise ValueError(f"manifest observation_sha256 must be a sequence for {record.name}")
-        if len(observations) != len(digests):
-            raise ValueError(f"manifest observation/hash cardinality mismatch for {record.name}")
         if len(observations) < self.config.max_image_num:
             raise ValueError(
                 f"manifest has only {len(observations)} observations for {record.name}; "
                 f"requires {self.config.max_image_num}"
             )
         seen: set[str] = set()
-        for filename, digest in zip(observations, digests):
+        for filename in observations:
             if not _safe_basename(filename):
                 raise ValueError(f"manifest observation filename is unsafe for {record.name}: {filename!r}")
             if filename in seen:
                 raise ValueError(f"manifest observation filenames contain duplicates for {record.name}")
             seen.add(filename)
-            if not isinstance(digest, str) or not digest:
-                raise ValueError(f"manifest observation digest is invalid for {record.name}")
 
-        for label, filename, digest in (
-            ("ground truth", record.normal_file, record.normal_sha256),
-            ("external mask", record.mask_file, record.mask_sha256),
+        for label, filename in (
+            ("ground truth", record.normal_file),
+            ("external mask", record.mask_file),
         ):
             if not _safe_basename(filename):
                 raise ValueError(f"manifest {label} filename is unsafe for {record.name}")
-            if not isinstance(digest, str) or not digest:
-                raise ValueError(f"manifest {label} digest is invalid for {record.name}")
 
         self._resolve_object_dir(record)
 
-    def _resolve_object_dir(self, record: PrivateObjectRecord) -> Path:
+    def _resolve_object_dir(self, record: PrivateSourceIndexRecord) -> Path:
         if not _safe_basename(record.name) or record.relative_dir != record.name:
             raise ValueError(f"manifest relative_dir is unsafe for {record.name}")
         candidate = self._data_root / record.relative_dir
@@ -190,7 +185,7 @@ class PrivateExrTrainDataset(Dataset):
     def epoch(self) -> int:
         return int(self._epoch_state.item())
 
-    def _selected_names(self, record: PrivateObjectRecord) -> tuple[str, ...]:
+    def _selected_names(self, record: PrivateSourceIndexRecord) -> tuple[str, ...]:
         return select_observation_names(
             record.observation_files,
             count=self.config.max_image_num,
@@ -211,10 +206,9 @@ class PrivateExrTrainDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _load_verified_sources(self, record: PrivateObjectRecord) -> dict[str, Any]:
+    def _load_verified_sources(self, record: PrivateSourceIndexRecord) -> dict[str, Any]:
         self._resolve_object_dir(record)
         source_shape = _finite_source_shape(record, self.config)
-        digest_by_name = dict(zip(record.observation_files, record.observation_sha256))
         selected_names = self._selected_names(record)
 
         images: list[np.ndarray] = []
@@ -222,10 +216,6 @@ class PrivateExrTrainDataset(Dataset):
         with open_private_source_snapshot(self.config, self.split, record) as source:
             for filename in selected_names:
                 image_raw, image_digest = source.read(filename=filename, role="selected observation")
-                if image_digest != digest_by_name[filename]:
-                    raise ValueError(
-                        f"selected observation {filename} digest mismatch for {record.name} in {self.split}"
-                    )
                 try:
                     image = read_rgb_exr_bytes(
                         image_raw,
@@ -244,10 +234,6 @@ class PrivateExrTrainDataset(Dataset):
                 selected_digests.append(image_digest)
 
             normal_raw, normal_digest = source.read(filename=record.normal_file, role="ground truth")
-            if normal_digest != record.normal_sha256:
-                raise ValueError(
-                    f"ground truth {record.normal_file} digest mismatch for {record.name} in {self.split}"
-                )
             try:
                 encoded_normal = read_rgb_exr_bytes(
                     normal_raw,
@@ -270,12 +256,14 @@ class PrivateExrTrainDataset(Dataset):
                     f"failed to decode ground truth {record.normal_file} for {record.name} in {self.split}"
                 ) from exc
             target_mask = np.asarray(normal_validity_mask(target_normal), dtype=np.float32)
+            gt_valid_pixels = int(np.count_nonzero(target_mask > 0))
+            if gt_valid_pixels == 0:
+                raise ValueError(
+                    f"empty GT-valid support for {record.normal_file} "
+                    f"for {record.name} in {self.split}"
+                )
 
             mask_raw, mask_digest = source.read(filename=record.mask_file, role="external mask")
-            if mask_digest != record.mask_sha256:
-                raise ValueError(
-                    f"external mask {record.mask_file} digest mismatch for {record.name} in {self.split}"
-                )
             try:
                 model_mask = read_mask_exr_bytes(
                     mask_raw,
@@ -290,6 +278,24 @@ class PrivateExrTrainDataset(Dataset):
                     f"external mask {record.mask_file} geometry mismatch for {record.name}: "
                     f"{model_mask.shape}, expected {source_shape}"
                 )
+            model_mask = np.asarray(model_mask > 0, dtype=np.float32)
+            mask_valid_pixels = int(np.count_nonzero(model_mask > 0))
+            if mask_valid_pixels == 0:
+                raise ValueError(
+                    f"empty external mask {record.mask_file} "
+                    f"for {record.name} in {self.split}"
+                )
+            outside = (target_mask > 0) & (model_mask <= 0)
+            gt_outside_mask_pixels = int(np.count_nonzero(outside))
+            if gt_outside_mask_pixels:
+                raise ValueError(
+                    f"{gt_outside_mask_pixels} GT-valid pixel(s) lie outside "
+                    f"the external mask for {record.name} in {self.split} "
+                    f"[file={record.mask_file}]"
+                )
+            mask_only_pixels = int(
+                np.count_nonzero((model_mask > 0) & (target_mask <= 0))
+            )
 
         return {
             "images": np.ascontiguousarray(np.stack(images, axis=-1), dtype=np.float32),
@@ -301,6 +307,13 @@ class PrivateExrTrainDataset(Dataset):
             "normal_digest": normal_digest,
             "mask_digest": mask_digest,
             "source_geometry": {"height": source_shape[0], "width": source_shape[1]},
+            "gt_valid_pixels": gt_valid_pixels,
+            "mask_valid_pixels": mask_valid_pixels,
+            "intersection_pixels": int(
+                np.count_nonzero((target_mask > 0) & (model_mask > 0))
+            ),
+            "gt_outside_mask_pixels": gt_outside_mask_pixels,
+            "mask_only_pixels": mask_only_pixels,
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -340,9 +353,9 @@ class PrivateExrTrainDataset(Dataset):
             "model": int(np.count_nonzero(geometry.model_mask > 0)),
             "source_target": int(np.count_nonzero(geometry.source_target_mask > 0)),
             "target": int(np.count_nonzero(geometry.target_mask > 0)),
-            "gt_valid_pixels": int(record.gt_valid_pixels),
-            "mask_valid_pixels": int(record.mask_valid_pixels),
-            "mask_only_pixels": int(record.mask_only_pixels),
+            "gt_valid_pixels": int(sources["gt_valid_pixels"]),
+            "mask_valid_pixels": int(sources["mask_valid_pixels"]),
+            "mask_only_pixels": int(sources["mask_only_pixels"]),
         }
         alpha = [float(value) for value in normalized.alpha]
         scales = [float(value) for value in normalized.scales]
@@ -362,7 +375,8 @@ class PrivateExrTrainDataset(Dataset):
             "mask_digest": sources["mask_digest"],
             "mask_policy": self.config.mask_policy,
             "mask_source": record.mask_file,
-            "target_mask_source": "normal_validity_mask",
+            "target_mask_source": f"{GT_VALIDITY_POLICY}({record.normal_file})",
+            "gt_validity_policy": GT_VALIDITY_POLICY,
             "model_mask_source": self.config.external_mask_filename,
             "source_geometry": dict(source_geometry),
             "roi": roi_values,
@@ -372,9 +386,11 @@ class PrivateExrTrainDataset(Dataset):
             "model_mask_count": mask_counts["model"],
             "source_target_mask_count": mask_counts["source_target"],
             "target_mask_count": mask_counts["target"],
-            "gt_valid_pixels": int(record.gt_valid_pixels),
-            "mask_valid_pixels": int(record.mask_valid_pixels),
-            "mask_only_pixels": int(record.mask_only_pixels),
+            "gt_valid_pixels": int(sources["gt_valid_pixels"]),
+            "mask_valid_pixels": int(sources["mask_valid_pixels"]),
+            "intersection_pixels": int(sources["intersection_pixels"]),
+            "gt_outside_mask_pixels": int(sources["gt_outside_mask_pixels"]),
+            "mask_only_pixels": int(sources["mask_only_pixels"]),
             "normalization": {
                 "alpha": alpha,
                 "scales": scales,

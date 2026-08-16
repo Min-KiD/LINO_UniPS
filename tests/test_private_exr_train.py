@@ -19,8 +19,8 @@ from src.data import private_exr_train
 from src.training import private_manifest
 from src.training.config import PrivateTrainConfig
 from src.training.private_manifest import (
-    PrivateSplitManifest,
-    build_private_split_manifest,
+    PrivateSplitIndex,
+    build_private_split_index,
 )
 from tests.comparison_helpers import write_mask_exr, write_rgb_exr
 
@@ -110,11 +110,64 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
         write_mask_exr(object_dir / "binary_mask.exr", external_mask)
         return object_dir
 
-    def manifest(self, split: str = "train", *, name: str = "alpha.data") -> tuple[PrivateTrainConfig, PrivateSplitManifest]:
+    def manifest(self, split: str = "train", *, name: str = "alpha.data") -> tuple[PrivateTrainConfig, PrivateSplitIndex]:
         config = self.config()
         root = self.train_root if split == "train" else self.test_root
         self._write_object(root, name)
-        return config, build_private_split_manifest(config, split)
+        return config, build_private_split_index(config, split)
+
+    def index(self, split: str = "train", *, name: str = "alpha.data") -> tuple[PrivateTrainConfig, PrivateSplitIndex]:
+        config = self.config()
+        root = self.train_root if split == "train" else self.test_root
+        self._write_object(root, name)
+        return config, build_private_split_index(config, split)
+
+    def test_lazy_index_reads_exactly_selected_observations_normal_and_mask(self):
+        config, index = self.index()
+        dataset = PrivateExrTrainDataset(config, index, split="train")
+        record = index.objects[0]
+        selected = set(dataset._selected_names(record))
+        read_names: list[str] = []
+        original = private_manifest.PrivateSourceSnapshot.read
+
+        def record_read(reader, filename, *, role):
+            read_names.append(filename)
+            return original(reader, filename=filename, role=role)
+
+        with mock.patch.object(
+            private_manifest.PrivateSourceSnapshot,
+            "read",
+            autospec=True,
+            side_effect=record_read,
+        ):
+            sample = dataset[0]
+
+        expected = selected | {"local_normal.exr", "binary_mask.exr"}
+        self.assertEqual(set(read_names), expected)
+        self.assertEqual(len(read_names), 8)
+        self.assertTrue(
+            (set(record.observation_files) - selected).isdisjoint(read_names)
+        )
+        self.assertEqual(
+            sample["metadata"]["gt_validity_policy"],
+            "sdm_corrected_v2_unit_band",
+        )
+
+    def test_lazy_index_ignores_tiny_gt_outside_but_rejects_unit_gt_outside(self):
+        config, index = self.index()
+        record = index.objects[0]
+        object_dir = self.train_root / record.name
+        encoded = np.full((256, 256, 3), 0.5, dtype=np.float32)
+        encoded[64:192, 64:192, 2] = 1.0
+        encoded[0, 0, 0] = 0.50005
+        write_rgb_exr(object_dir / record.normal_file, encoded)
+        sample = PrivateExrTrainDataset(config, index, split="train")[0]
+        self.assertEqual(sample["metadata"]["gt_outside_mask_pixels"], 0)
+
+        encoded[0, 0] = (1.0, 0.5, 0.5)
+        write_rgb_exr(object_dir / record.normal_file, encoded)
+        with self.assertRaisesRegex(ValueError, "GT-valid.*outside.*mask"):
+            PrivateExrTrainDataset(config, index, split="train")[0]
 
     def test_train_sample_has_six_epoch_selected_lights_and_separate_masks(self):
         config, manifest = self.manifest()
@@ -135,13 +188,27 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
         self.assertTrue(sample["imgs"].is_contiguous())
 
         record = manifest.objects[0]
-        digest_by_name = dict(zip(record.observation_files, record.observation_sha256))
         self.assertEqual(
             sample["metadata"]["selected_image_sha256"],
-            [digest_by_name[name] for name in sample["metadata"]["selected_images"]],
+            [
+                hashlib.sha256(
+                    (self.train_root / record.name / name).read_bytes()
+                ).hexdigest()
+                for name in sample["metadata"]["selected_images"]
+            ],
         )
-        self.assertEqual(sample["metadata"]["normal_sha256"], record.normal_sha256)
-        self.assertEqual(sample["metadata"]["mask_sha256"], record.mask_sha256)
+        self.assertEqual(
+            sample["metadata"]["normal_sha256"],
+            hashlib.sha256(
+                (self.train_root / record.name / record.normal_file).read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            sample["metadata"]["mask_sha256"],
+            hashlib.sha256(
+                (self.train_root / record.name / record.mask_file).read_bytes()
+            ).hexdigest(),
+        )
 
         expected_layout = {
             "imgs": ((3, 512, 512, 6), torch.float32),
@@ -302,21 +369,28 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "epoch"):
                 dataset.set_epoch(value)  # type: ignore[arg-type]
 
-    def test_mutated_selected_observation_digest_is_rejected_before_tensor_creation(self):
+    def test_same_name_observation_change_is_validated_lazily_and_recorded(self):
         config, manifest = self.manifest()
         record = manifest.objects[0]
         selected = record.observation_files[0]
         changed = np.full((256, 256, 3), 99.0, dtype=np.float32)
         write_rgb_exr(self.train_root / record.name / selected, changed)
-        with self.assertRaisesRegex(ValueError, "digest"):
-            PrivateExrTrainDataset(config, manifest, split="train")[0]
+        sample = PrivateExrTrainDataset(config, manifest, split="train")[0]
+        if selected in sample["metadata"]["selected_images"]:
+            position = sample["metadata"]["selected_images"].index(selected)
+            self.assertEqual(
+                sample["metadata"]["selected_image_sha256"][position],
+                hashlib.sha256(
+                    (self.train_root / record.name / selected).read_bytes()
+                ).hexdigest(),
+            )
 
     def test_mutated_ground_truth_digest_is_rejected_before_tensor_creation(self):
         config, manifest = self.manifest()
         record = manifest.objects[0]
         changed = np.full((256, 256, 3), 0.5, dtype=np.float32)
         write_rgb_exr(self.train_root / record.name / record.normal_file, changed)
-        with self.assertRaisesRegex(ValueError, "digest"):
+        with self.assertRaisesRegex(ValueError, "empty GT-valid"):
             PrivateExrTrainDataset(config, manifest, split="train")[0]
 
     def test_mutated_external_mask_digest_is_rejected_before_tensor_creation(self):
@@ -325,7 +399,7 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
         changed = np.zeros((256, 256), dtype=np.float32)
         changed[48:208, 48:208] = 1.0
         write_mask_exr(self.train_root / record.name / record.mask_file, changed)
-        with self.assertRaisesRegex(ValueError, "digest"):
+        with self.assertRaisesRegex(ValueError, "GT-valid.*outside|empty external mask"):
             PrivateExrTrainDataset(config, manifest, split="train")[0]
 
     def test_mid_read_swap_preserves_observation_gt_and_mask_byte_snapshots(self):
@@ -400,13 +474,7 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
                 ):
                     sample = dataset[0]
                 path.write_bytes(original)
-                expected = (
-                    record.observation_sha256[record.observation_files.index(selected_name)]
-                    if role == "observation"
-                    else record.normal_sha256
-                    if role == "ground truth"
-                    else record.mask_sha256
-                )
+                expected = hashlib.sha256(original).hexdigest()
                 if role == "external mask":
                     self.assertEqual(sample["metadata"]["mask_sha256"], expected)
                 else:
@@ -460,7 +528,7 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
         test_root.mkdir()
         config = self.config(train_dir=nested_train, test_dir=test_root)
         self._write_object(nested_train, "alpha.data")
-        manifest = build_private_split_manifest(config, "train")
+        manifest = build_private_split_index(config, "train")
 
         replacement_parent = self.root / "replacement-parent"
         shutil.copytree(nested_parent, replacement_parent)
