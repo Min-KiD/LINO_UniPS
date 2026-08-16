@@ -78,6 +78,7 @@ The fixed preset also enables GPU activation checkpointing:
 train_batch_size: 1
 train_pixel_budget: 4096
 activation_checkpointing: true
+train_log_every_batches: 10
 ```
 
 This does not change LiNo_UniPS parameters, checkpoint keys, six-light input,
@@ -89,6 +90,13 @@ contract, so changing it requires a new cold-start/initialization run rather
 than silently continuing an incompatible runtime contract. A successful first
 optimizer step on the target GPU is still required to establish whether the
 23 GiB device is large enough.
+
+`train_log_every_batches` controls monitoring only. With the default value 10,
+LINO prints batch 1, every tenth batch, and the last batch with loss, running
+MAE, elapsed time, step time, ETA, and current CUDA memory. Set it to `0` to
+disable batch lines. Startup and epoch summaries are still printed, and this
+setting is excluded from resume compatibility because it does not affect the
+training result.
 
 If the 512 command still raises CUDA OOM, use the isolated LINO-256 preset:
 

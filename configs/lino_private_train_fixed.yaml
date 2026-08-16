@@ -26,6 +26,7 @@ canonical_resolution: 256
 pixel_samples: 2048
 train_pixel_budget: 4096
 activation_checkpointing: true # Recompute GPU activations in backward to reduce peak VRAM.
+train_log_every_batches: 10 # Print batch progress without changing training behavior.
 precision: "bf16"
 device: "cuda"
 deterministic: false

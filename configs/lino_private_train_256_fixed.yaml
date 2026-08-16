@@ -26,6 +26,7 @@ canonical_resolution: 128
 pixel_samples: 2048
 train_pixel_budget: 4096
 activation_checkpointing: true
+train_log_every_batches: 10
 precision: "bf16"
 device: "cuda"
 deterministic: false

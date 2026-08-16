@@ -801,6 +801,7 @@ def build_run_contract(
             "resume_checkpoint",
             "save_dir",
             "epochs",
+            "train_log_every_batches",
         ):
             strict_snapshot.pop(operational, None)
         contract["config_snapshot"] = strict_snapshot

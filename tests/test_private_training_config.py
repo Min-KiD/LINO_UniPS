@@ -152,6 +152,7 @@ class PrivateTrainingConfigTests(unittest.TestCase):
                 "pixel_samples": 2048,
                 "train_pixel_budget": 131072,
                 "activation_checkpointing": True,
+                "train_log_every_batches": 10,
                 "precision": "bf16",
                 "device": "cuda",
                 "deterministic": True,

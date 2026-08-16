@@ -19,6 +19,7 @@ import tempfile
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -196,6 +197,15 @@ def _cuda_peak(device: torch.device) -> tuple[int | None, int | None]:
     return int(torch.cuda.max_memory_allocated(device)), int(torch.cuda.max_memory_reserved(device))
 
 
+def _cuda_progress(device: torch.device) -> str:
+    if device.type != "cuda":
+        return ""
+    gib = float(1024**3)
+    allocated = torch.cuda.memory_allocated(device) / gib
+    reserved = torch.cuda.memory_reserved(device) / gib
+    return f" | VRAM: {allocated:.2f} GiB allocated, {reserved:.2f} GiB reserved"
+
+
 @contextmanager
 def _preserve_validation_numpy_state(seed: int):
     """Seed released NumPy pixel grouping without perturbing caller state."""
@@ -230,7 +240,8 @@ def train_epoch(
     total_objects = 0
     started = clock()
     first_batch_reported = False
-    for batch in train_loader:
+    for batch_index, batch in enumerate(train_loader, start=1):
+        batch_started = clock()
         if not first_batch_reported:
             first_batch_reported = True
             if first_batch_callback is not None:
@@ -281,10 +292,32 @@ def train_epoch(
             mae = sampled_angular_mae(predictions, targets)
         if not torch.isfinite(mae).item():
             raise FloatingPointError("training angular MAE is non-finite")
-        total_loss += float(loss.detach().cpu()) * batch_size
-        total_mae += float(mae.detach().cpu()) * batch_size
+        batch_loss = float(loss.detach().cpu())
+        batch_mae = float(mae.detach().cpu())
+        total_loss += batch_loss * batch_size
+        total_mae += batch_mae * batch_size
         total_objects += batch_size
         global_step += 1
+        interval = config.train_log_every_batches
+        should_report = interval > 0 and (
+            batch_index == 1 or batch_index % interval == 0 or batch_index == batches
+        )
+        if should_report:
+            elapsed = float(clock() - started)
+            step_seconds = float(clock() - batch_started)
+            remaining = batches - batch_index
+            eta = (elapsed / batch_index) * remaining
+            width = max(4, len(str(batches)))
+            print(
+                f"[Batch {batch_index:0{width}d}/{batches}] "
+                f"Loss: {batch_loss:.4f} | MAE (avg so far): "
+                f"{total_mae / total_objects:.4f} | "
+                f"Elapsed: {format_clock_duration(elapsed)} | "
+                f"Step: {format_clock_duration(step_seconds)} | "
+                f"ETA: {format_clock_duration(eta)}"
+                f"{_cuda_progress(device)}",
+                flush=True,
+            )
     if total_objects == 0:  # pragma: no cover - guarded by loader length
         raise ValueError("private training dataset must contain at least one object")
     del started, batches
@@ -628,9 +661,11 @@ def run_private_training(
         if config.final_selection_manifest is None
         else _read_final_selection(config.final_selection_manifest)
     )
+    print("Preparing LINO model schema...", flush=True)
     schema_provider = schema_provider or (lambda: _production_schema_provider(config))
     expected_schema = tuple(schema_provider())
     architecture_digest = schema_fingerprint(expected_schema)
+    print("LINO model schema ready.", flush=True)
     source_revision = "lino-private-exr-training-v2"
     contract = build_run_contract(
         config,
@@ -672,9 +707,11 @@ def run_private_training(
         if existing_rows and existing_rows[-1].epoch != expected_completed:
             raise ValueError("resume metrics.csv does not end at checkpoint completed_epoch")
     device = device_resolver(config.device)
+    print(f"Using device: {device}", flush=True)
     if config.precision == "bf16" and device.type != "cuda":
         raise RuntimeError("private LINO bf16 training requires CUDA")
     factory = model_factory or (lambda: _production_model_factory(config))
+    print("Initializing LINO model weights...", flush=True)
     model = factory()
     if not isinstance(model, torch.nn.Module):
         raise TypeError("model_factory must return a torch.nn.Module")
@@ -682,6 +719,7 @@ def run_private_training(
     if live_digest != architecture_digest:
         raise ValueError("live model schema differs from CPU schema preflight")
     model.to(device=device)
+    print("LINO model initialized and moved to the training device.", flush=True)
     optimizer, scheduler = create_optimizer_scheduler(model, config)
     progress_epoch = 0
     global_step = 0
@@ -712,6 +750,46 @@ def run_private_training(
         test_indices = list(range(min(2, len(test_dataset))))
         train_dataset = Subset(train_dataset, train_indices)
         test_dataset = Subset(test_dataset, test_indices)
+    train_object_count = len(train_dataset)
+    test_object_count = len(test_dataset)
+    train_batch_count = (
+        train_object_count + config.train_batch_size - 1
+    ) // config.train_batch_size
+    print(
+        "Model geometry: "
+        f"internal {config.max_image_resolution} | "
+        f"canonical {config.canonical_resolution}",
+        flush=True,
+    )
+    print(f"Precision: {config.precision}", flush=True)
+    print(
+        f"Training objects: {train_object_count} | "
+        f"Validation objects: {test_object_count}",
+        flush=True,
+    )
+    print(
+        f"Batch size: {config.train_batch_size} | "
+        f"Lights/object: {config.max_image_num} | "
+        f"Batches/epoch: {train_batch_count}",
+        flush=True,
+    )
+    print(
+        f"AdamW optimizer: lr={config.learning_rate:g}, "
+        f"weight_decay={config.weight_decay:g}, betas={config.adamw_betas}",
+        flush=True,
+    )
+    print(
+        f"Scheduler: StepLR step_size={config.scheduler_step_size}, "
+        f"gamma={config.scheduler_gamma:g}",
+        flush=True,
+    )
+    print(
+        "Model startup: "
+        f"{config.startup_mode} | activation checkpointing: "
+        f"{'enabled' if config.activation_checkpointing else 'disabled'} | "
+        f"batch log interval: {config.train_log_every_batches}",
+        flush=True,
+    )
     rows = list(existing_rows)
     final_export = run_dir / "exports" / f"lino_epoch_{progress_epoch:03d}.pth"
     first_batch_reported = False
@@ -752,6 +830,16 @@ def run_private_training(
             worker_init_fn=seed_worker,
             collate_fn=collate_private_exr,
             pin_memory=device.type == "cuda",
+        )
+        print(
+            f"[Epoch {logical_epoch + 1}/{config.epochs}] START "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"elapsed_total={format_clock_duration(float(clock() - run_started))}",
+            flush=True,
+        )
+        print(
+            f"Training {len(ordered)} objects in {len(train_loader)} batches",
+            flush=True,
         )
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)

@@ -128,6 +128,7 @@ class PrivateTrainConfig:
     save_every_epochs: int
     keep_milestone_epochs: tuple[int, ...]
     activation_checkpointing: bool
+    train_log_every_batches: int = 10
     source_validation: SourceValidationConfig = field(
         default_factory=SourceValidationConfig
     )
@@ -247,6 +248,11 @@ class PrivateTrainConfig:
             raise ValueError("deterministic must be a boolean")
         if not isinstance(self.activation_checkpointing, bool):
             raise ValueError("activation_checkpointing must be a boolean")
+        if (
+            not _is_int(self.train_log_every_batches)
+            or self.train_log_every_batches < 0
+        ):
+            raise ValueError("train_log_every_batches must be a nonnegative integer")
 
         for field_name, minimum, strict in (
             ("learning_rate", 0.0, True),
@@ -277,6 +283,7 @@ class PrivateTrainConfig:
 
 
 _CONFIG_FIELDS = tuple(field.name for field in fields(PrivateTrainConfig))
+_OPTIONAL_CONFIG_FIELDS = frozenset({"train_log_every_batches"})
 
 
 def _raw_mapping(raw: object) -> dict[str, Any]:
@@ -355,7 +362,11 @@ def load_private_train_config(path: str | Path) -> PrivateTrainConfig:
     unknown = sorted(set(values) - set(_CONFIG_FIELDS))
     if unknown:
         raise ValueError(f"unknown private training config keys: {', '.join(unknown)}")
-    missing = [field_name for field_name in _CONFIG_FIELDS if field_name not in values]
+    missing = [
+        field_name
+        for field_name in _CONFIG_FIELDS
+        if field_name not in values and field_name not in _OPTIONAL_CONFIG_FIELDS
+    ]
     if missing:
         raise ValueError(f"missing private training config keys: {', '.join(missing)}")
 
@@ -413,6 +424,10 @@ def load_private_train_config(path: str | Path) -> PrivateTrainConfig:
         keep_milestone_epochs=_milestones(values["keep_milestone_epochs"]),
         activation_checkpointing=_bool_value(
             values["activation_checkpointing"], "activation_checkpointing"
+        ),
+        train_log_every_batches=_int_value(
+            values.get("train_log_every_batches", 10),
+            "train_log_every_batches",
         ),
         source_validation=_source_validation(values["source_validation"]),
     )
