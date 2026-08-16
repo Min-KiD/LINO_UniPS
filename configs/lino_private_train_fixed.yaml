@@ -43,4 +43,4 @@ source_validation:
   mode: "lazy"
   structural_index_version: "private_exr_index_v1"
   persistent_content_ledger: false
-  progress_every_objects: 100
+  progress_every_objects: 0  # Disable periodic indexing messages; final summary remains.

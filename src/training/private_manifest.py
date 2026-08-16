@@ -1001,7 +1001,7 @@ def build_private_split_index(
                     split=split_name,
                 )
             )
-            if completed % interval == 0 or completed == total:
+            if interval > 0 and completed % interval == 0:
                 print(f"Indexed {completed}/{total} {split_name} objects")
 
         _assert_root_fd(

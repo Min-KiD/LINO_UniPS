@@ -81,8 +81,8 @@ class SourceValidationConfig:
             raise ValueError("unsupported structural index version")
         if self.persistent_content_ledger:
             raise ValueError("persistent content ledger is not supported")
-        if not _is_int(self.progress_every_objects) or self.progress_every_objects <= 0:
-            raise ValueError("progress_every_objects must be a positive integer")
+        if not _is_int(self.progress_every_objects) or self.progress_every_objects < 0:
+            raise ValueError("progress_every_objects must be a non-negative integer")
 
 
 @dataclass(frozen=True)

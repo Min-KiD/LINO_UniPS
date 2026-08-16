@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
 
-from src.training.config import PrivateTrainConfig
+from src.training.config import PrivateTrainConfig, SourceValidationConfig
 from src.training import private_manifest
 from src.training.private_manifest import (
     build_private_split_manifest,
@@ -168,6 +170,19 @@ class PrivateTrainingManifestTests(unittest.TestCase):
         )
         self.assertEqual(record.normal_file, "local_normal.exr")
         self.assertEqual(record.mask_file, "binary_mask.exr")
+
+    def test_zero_progress_interval_prints_no_periodic_index_messages(self):
+        self._write_object("alpha.data")
+        self._write_object("beta.data")
+        config = self.config(
+            source_validation=SourceValidationConfig(progress_every_objects=0)
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            private_manifest.build_private_split_index(config, "train")
+
+        self.assertEqual(output.getvalue(), "")
 
     def test_structural_index_digest_ignores_same_name_byte_changes(self):
         object_dir = self._write_object("alpha.data")

@@ -176,8 +176,8 @@ class PrivateTrainingConfigTests(unittest.TestCase):
             ("mode", "eager", "lazy source validation only"),
             ("structural_index_version", "other", "structural index version"),
             ("persistent_content_ledger", True, "content ledger"),
-            ("progress_every_objects", 0, "positive integer"),
-            ("progress_every_objects", True, "positive integer"),
+            ("progress_every_objects", -1, "non-negative integer"),
+            ("progress_every_objects", True, "non-negative integer"),
         ):
             with self.subTest(field_name=field_name), self.assertRaisesRegex(
                 ValueError, message
@@ -185,6 +185,14 @@ class PrivateTrainingConfigTests(unittest.TestCase):
                 raw = self.valid_mapping()
                 raw["source_validation"][field_name] = value
                 load_private_train_config(self._write_yaml(raw))
+
+    def test_zero_progress_interval_disables_periodic_index_messages(self):
+        raw = self.valid_mapping()
+        raw["source_validation"]["progress_every_objects"] = 0
+
+        config = load_private_train_config(self._write_yaml(raw))
+
+        self.assertEqual(config.source_validation.progress_every_objects, 0)
 
     def test_source_validation_rejects_missing_and_unknown_nested_keys(self):
         raw = self.valid_mapping()
