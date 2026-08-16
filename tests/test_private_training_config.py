@@ -218,6 +218,14 @@ class PrivateTrainingConfigTests(unittest.TestCase):
         self.assertEqual(resolved_config_dict(config)["adamw_betas"], [0.9, 0.98])
         self.assertEqual(list(resolved_config_dict(config)), list(config.__dataclass_fields__))
 
+    def test_final_selection_manifest_may_be_deferred(self):
+        raw = self.valid_mapping()
+        raw["final_selection_manifest"] = None
+
+        config = load_private_train_config(self._write_yaml(raw))
+
+        self.assertIsNone(config.final_selection_manifest)
+
     def test_config_is_immutable(self):
         config = load_private_train_config(self._write_yaml(self.valid_mapping()))
         with self.assertRaises(AttributeError):
@@ -383,7 +391,7 @@ class PrivateTrainingConfigTests(unittest.TestCase):
             str(config.save_dir), "runs/lino_private_fixed_lazy_sdmvalid_bf16"
         )
         self.assertEqual(config.source_validation.mode, "lazy")
-        self.assertEqual(str(config.final_selection_manifest), canonical_selection)
+        self.assertIsNone(config.final_selection_manifest)
         inference_yaml = (
             repo_root / "configs/lino_private_infer_trained_fixed.yaml"
         ).read_text(encoding="utf-8")

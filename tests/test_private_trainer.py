@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import contextlib
+from dataclasses import replace
 from io import StringIO
 import tempfile
 import unittest
@@ -313,6 +314,18 @@ class PrivateTrainerTests(unittest.TestCase):
         self.assertTrue((summary.run_dir / "exports/lino_best_validation.pth").is_file())
         self.assertTrue((summary.run_dir / "config.resolved.yaml").is_file())
         self.assertTrue((summary.run_dir / "data_contract.json").is_file())
+
+    def test_deferred_final_selection_never_reads_an_inference_manifest(self):
+        config = replace(self.config(epochs=1), final_selection_manifest=None)
+
+        with mock.patch(
+            "src.training.trainer._read_final_selection",
+            side_effect=AssertionError("training must not read a deferred manifest"),
+        ):
+            summary = run_private_training(config, **self.dependencies())
+
+        contract = json.loads((summary.run_dir / "data_contract.json").read_text())
+        self.assertIsNone(contract["final_selection_manifest_sha256"])
 
     def test_resume_appends_epoch_without_repeating_metrics(self):
         first = run_private_training(self.config(epochs=1), **self.dependencies())

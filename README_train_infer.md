@@ -35,22 +35,22 @@ python -m pip install -r requirements.txt
 test -d /mnt/18TData/minhnv/train
 test -d /mnt/18TData/minhnv/test
 test -d /mnt/18TData/minhnv/inference
-test -f output/sdm_lino_comparison/external/selected_lights.json
 ```
 
 The training preset expects each train/test object to contain finite
 `image*.exr` observations, `local_normal.exr`, and an independently generated
-`binary_mask.exr`, all at 256x256. The final-selection manifest is used only
-to bind the later 16-light comparison; it must exist before training starts.
-It is the canonical manifest written by the earlier seeded comparison run. If
-the check fails, locate any prior manifest with:
+`binary_mask.exr`, all at 256x256. Training does not require a final-selection
+manifest. The checked-in preset deliberately defers that inference-only
+choice:
 
-```bash
-find output -name selected_lights.json -print
+```yaml
+final_selection_manifest: null
+light_selection: "seeded"
 ```
 
-Use only the manifest from the intended `sdm_lino_comparison/external`
-protocol; do not substitute an unrelated selection.
+The six training lights vary deterministically by seed, split, epoch, and
+object. The final 16-light manifest is pinned during inference, where LINO and
+SDM must consume the same ordered observations for paired comparison.
 
 ### Cold-start training
 
@@ -284,7 +284,6 @@ PY
 cp configs/lino_private_train_fixed.yaml /tmp/lino_private_smoke.yaml
 sed -i \
   -e 's#save_dir: "./runs/lino_private_fixed_lazy_sdmvalid_bf16"#save_dir: "./runs/lino_private_smoke"#' \
-  -e 's#final_selection_manifest: "./output/sdm_lino_comparison/external/selected_lights.json"#final_selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"#' \
   -e 's/epochs: 100/epochs: 1/' \
   /tmp/lino_private_smoke.yaml
 python train_private.py --config /tmp/lino_private_smoke.yaml --smoke

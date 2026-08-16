@@ -93,7 +93,7 @@ class PrivateTrainConfig:
     startup_mode: str
     init_checkpoint: Path | None
     resume_checkpoint: Path | None
-    final_selection_manifest: Path
+    final_selection_manifest: Path | None
     object_suffix: str
     image_prefix: str
     image_extension: str
@@ -134,12 +134,15 @@ class PrivateTrainConfig:
             "train_dir",
             "test_dir",
             "save_dir",
-            "final_selection_manifest",
         )
         for field_name in path_fields:
             if not isinstance(getattr(self, field_name), Path):
                 raise ValueError(f"{field_name} must be a path")
-        for field_name in ("init_checkpoint", "resume_checkpoint"):
+        for field_name in (
+            "init_checkpoint",
+            "resume_checkpoint",
+            "final_selection_manifest",
+        ):
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, Path):
                 raise ValueError(f"{field_name} must be a path or null")
@@ -358,7 +361,7 @@ def load_private_train_config(path: str | Path) -> PrivateTrainConfig:
         startup_mode=_string_value(values["startup_mode"], "startup_mode"),
         init_checkpoint=path_field("init_checkpoint", nullable=True),
         resume_checkpoint=path_field("resume_checkpoint", nullable=True),
-        final_selection_manifest=path_field("final_selection_manifest"),  # type: ignore[arg-type]
+        final_selection_manifest=path_field("final_selection_manifest", nullable=True),
         object_suffix=_string_value(values["object_suffix"], "object_suffix"),
         image_prefix=_string_value(values["image_prefix"], "image_prefix"),
         image_extension=_string_value(values["image_extension"], "image_extension"),

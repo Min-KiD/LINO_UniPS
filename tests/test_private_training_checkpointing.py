@@ -29,6 +29,7 @@ from src.training.checkpointing import (
     publish_epoch_artifacts,
     publish_tree_artifacts,
     save_resume_checkpoint,
+    _validate_run_contract,
 )
 
 
@@ -72,6 +73,16 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def test_run_contract_preserves_deferred_final_selection(self) -> None:
+        contract = build_run_contract(
+            SimpleNamespace(epochs=4),
+            base_contract=self.contract,
+            final_selection_manifest_sha256=None,
+        )
+
+        self.assertIsNone(contract["final_selection_manifest_sha256"])
+        self.assertIs(_validate_run_contract(contract), contract)
 
     def test_raw_pth_cannot_be_used_as_resume(self) -> None:
         path = self.root / "model.pth"

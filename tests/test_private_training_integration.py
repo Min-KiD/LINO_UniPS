@@ -261,10 +261,7 @@ class PrivateTrainingDocumentationTests(unittest.TestCase):
             'selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"',
             guide,
         )
-        self.assertIn(
-            'final_selection_manifest: "/tmp/lino_private_smoke_selected_lights.json"',
-            guide,
-        )
+        self.assertIn("final_selection_manifest: null", guide)
         self.assertIn("exactly two object keys", guide)
         self.assertIn("exactly 16 unique light names", guide)
         self.assertIn("shutil.copytree", guide)
@@ -272,10 +269,8 @@ class PrivateTrainingDocumentationTests(unittest.TestCase):
         self.assertIn("SDM does not require retraining", guide)
         self.assertIn("eight files", guide)
         self.assertIn("lino-private-exr-training-v2", guide)
-        self.assertIn(
-            "output/sdm_lino_comparison/external/selected_lights.json", guide
-        )
-        self.assertIn("find output -name selected_lights.json", guide)
+        self.assertIn("Training does not require a final-selection", guide)
+        self.assertIn("final 16-light manifest is pinned during inference", guide)
 
 
 if __name__ == "__main__":

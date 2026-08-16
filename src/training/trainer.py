@@ -609,7 +609,11 @@ def run_private_training(
         )
     train_manifest = indexes["train"]
     test_manifest = indexes["test"]
-    final_digest = _read_final_selection(config.final_selection_manifest)
+    final_digest = (
+        None
+        if config.final_selection_manifest is None
+        else _read_final_selection(config.final_selection_manifest)
+    )
     schema_provider = schema_provider or (lambda: _production_schema_provider(config))
     expected_schema = tuple(schema_provider())
     architecture_digest = schema_fingerprint(expected_schema)

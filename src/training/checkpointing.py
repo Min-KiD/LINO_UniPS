@@ -633,12 +633,19 @@ def _validate_run_contract(value: object) -> Mapping[str, object]:
         "architecture_schema_sha256",
         "train_manifest_sha256",
         "test_manifest_sha256",
-        "final_selection_manifest_sha256",
         "source_revision",
         "gt_validity_policy",
     ):
         if not isinstance(contract[key], str) or not contract[key]:
             raise ValueError(f"run_contract {key} must be a non-empty string")
+    selection_digest = contract["final_selection_manifest_sha256"]
+    if selection_digest is not None and (
+        not isinstance(selection_digest, str) or not selection_digest
+    ):
+        raise ValueError(
+            "run_contract final_selection_manifest_sha256 must be null "
+            "or a non-empty string"
+        )
     if not isinstance(contract["runtime_versions"], Mapping):
         raise ValueError("run_contract runtime_versions must be a mapping")
     if not isinstance(contract["config_snapshot"], Mapping):
@@ -806,8 +813,11 @@ def build_run_contract(
         contract["train_manifest_sha256"] = str(train_manifest_sha256)
     if test_manifest_sha256 is not None:
         contract["test_manifest_sha256"] = str(test_manifest_sha256)
-    if final_selection_manifest_sha256 is not None:
-        contract["final_selection_manifest_sha256"] = str(final_selection_manifest_sha256)
+    contract["final_selection_manifest_sha256"] = (
+        None
+        if final_selection_manifest_sha256 is None
+        else str(final_selection_manifest_sha256)
+    )
     if source_revision is not None:
         contract["source_revision"] = str(source_revision)
     if gt_validity_policy is not None:

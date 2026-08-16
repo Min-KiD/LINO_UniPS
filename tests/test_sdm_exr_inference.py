@@ -409,6 +409,51 @@ class SdmExrInferenceTests(unittest.TestCase):
             hashlib.sha256(config.checkpoint.with_suffix(".json").read_bytes()).hexdigest(),
         )
 
+    def test_trained_route_accepts_manifest_when_training_deferred_selection(self):
+        config = self._strict_private_fixture()
+        sidecar = config.checkpoint.with_suffix(".json")
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload["data_contract"]["final_selection_manifest_sha256"] = None
+        sidecar.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        result = run_lino_inference(
+            config, model_loader=lambda *_args: _PositiveZStub([])
+        )
+
+        self.assertEqual(result["selected_light_count"], 16)
+        self.assertEqual(
+            result["selection_manifest_sha256"],
+            hashlib.sha256(config.selection_manifest.read_bytes()).hexdigest(),
+        )
+
+    def test_trained_route_rejects_missing_training_selection_contract_key(self):
+        config = self._strict_private_fixture()
+        sidecar = config.checkpoint.with_suffix(".json")
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        del payload["data_contract"]["final_selection_manifest_sha256"]
+        sidecar.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        loader = mock.Mock(side_effect=AssertionError("model must not be allocated"))
+
+        with self.assertRaisesRegex(
+            ValueError, "missing final_selection_manifest_sha256"
+        ):
+            run_lino_inference(config, model_loader=loader)
+
+        loader.assert_not_called()
+
+    def test_trained_route_keeps_explicit_training_manifest_binding(self):
+        config = self._strict_private_fixture()
+        selection = config.selection_manifest
+        payload = json.loads(selection.read_text(encoding="utf-8"))
+        payload["alpha.data"] = list(reversed(payload["alpha.data"]))
+        selection.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        loader = mock.Mock(side_effect=AssertionError("model must not be allocated"))
+
+        with self.assertRaisesRegex(ValueError, "final selection manifest digest"):
+            run_lino_inference(config, model_loader=loader)
+
+        loader.assert_not_called()
+
     def test_released_route_keeps_permissive_default_and_provenance(self):
         self.make_dataset("alpha.data")
         result, _ = self.run_with_stub(self.config())

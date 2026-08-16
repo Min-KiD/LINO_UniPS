@@ -284,12 +284,22 @@ def _validate_trained_export_sidecar(
     if snapshot.get("max_image_num") != 6 or snapshot.get("light_selection") != "seeded":
         raise ValueError("LINO sidecar training light-selection contract is invalid")
 
-    final_selection_digest = _nonempty_text(
-        contract.get("final_selection_manifest_sha256"),
-        label="LINO sidecar final_selection_manifest_sha256",
-    )
-    if final_selection_digest != sha256_bytes(selection_source_bytes):
-        raise ValueError("LINO sidecar final selection manifest digest does not match manifest bytes")
+    if "final_selection_manifest_sha256" not in contract:
+        raise ValueError(
+            "LINO sidecar data_contract is missing "
+            "final_selection_manifest_sha256"
+        )
+    final_selection_digest = contract["final_selection_manifest_sha256"]
+    if final_selection_digest is not None:
+        final_selection_digest = _nonempty_text(
+            final_selection_digest,
+            label="LINO sidecar final_selection_manifest_sha256",
+        )
+        if final_selection_digest != sha256_bytes(selection_source_bytes):
+            raise ValueError(
+                "LINO sidecar final selection manifest digest does not match "
+                "manifest bytes"
+            )
     return {
         "path": str(sidecar.resolve(strict=True)),
         "identity": sidecar_identity,
