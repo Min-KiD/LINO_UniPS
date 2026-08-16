@@ -54,6 +54,39 @@ class PrivateSplitManifest:
     objects: tuple[PrivateObjectRecord, ...]
 
 
+@dataclass(frozen=True)
+class PrivateSourceIndexRecord:
+    """Filename-only metadata for one lazily validated private object."""
+
+    name: str
+    relative_dir: str
+    height: int
+    width: int
+    observation_files: tuple[str, ...]
+    normal_file: str
+    mask_file: str
+
+
+@dataclass(frozen=True)
+class PrivateSplitIndex:
+    """Version-2 structural split index with no source-content claims."""
+
+    version: int
+    split: str
+    data_root: str
+    objects: tuple[PrivateSourceIndexRecord, ...]
+    structural_index_version: str
+    object_suffix: str
+    image_prefix: str
+    image_extension: str
+    normal_encoding: str
+    expected_source_geometry: tuple[int, int]
+    mask_policy: str
+    max_image_num: int
+    light_selection: str
+    seed: int
+
+
 def _safe_basename(value: Any) -> bool:
     """Return whether ``value`` is one portable direct filename component."""
 
@@ -384,14 +417,16 @@ class PrivateSourceSnapshot:
         self,
         config: PrivateTrainConfig,
         split: str,
-        record: PrivateObjectRecord,
+        record: PrivateObjectRecord | PrivateSourceIndexRecord,
     ) -> None:
         if not isinstance(config, PrivateTrainConfig):
             raise TypeError("config must be a PrivateTrainConfig")
         if split not in {"train", "test"}:
             raise ValueError("split must be one of: train, test")
-        if not isinstance(record, PrivateObjectRecord):
-            raise TypeError("record must be a PrivateObjectRecord")
+        if not isinstance(record, (PrivateObjectRecord, PrivateSourceIndexRecord)):
+            raise TypeError(
+                "record must be a PrivateObjectRecord or PrivateSourceIndexRecord"
+            )
         if not _safe_basename(record.name) or record.relative_dir != record.name:
             raise ValueError(f"manifest relative_dir is unsafe for {record.name}")
 
@@ -513,11 +548,104 @@ class PrivateSourceSnapshot:
 def open_private_source_snapshot(
     config: PrivateTrainConfig,
     split: str,
-    record: PrivateObjectRecord,
+    record: PrivateObjectRecord | PrivateSourceIndexRecord,
 ) -> PrivateSourceSnapshot:
     """Open a descriptor-pinned source snapshot for one manifest record."""
 
     return PrivateSourceSnapshot(config, split, record)
+
+
+def _build_source_index_record(
+    root_fd: int,
+    root_expected: tuple[int, int],
+    object_name: str,
+    object_expected: tuple[int, int],
+    root: Path,
+    config: PrivateTrainConfig,
+    *,
+    split: str,
+) -> PrivateSourceIndexRecord:
+    """Inspect names and entry types without opening any source file."""
+
+    object_fd, object_identity, object_path = _open_object(
+        root_fd,
+        root_expected,
+        object_name,
+        root,
+        split=split,
+    )
+    try:
+        if object_identity != object_expected:
+            _raise_failure(
+                split,
+                object_name,
+                "<object-directory>",
+                "object directory identity changed",
+            )
+        observations = _source_entries(
+            object_fd,
+            split=split,
+            object_name=object_name,
+            config=config,
+        )
+        minimum = int(config.max_image_num)
+        if len(observations) < minimum:
+            _raise_failure(
+                split,
+                object_name,
+                "<observations>",
+                f"only {len(observations)} observation(s); requires {minimum}",
+            )
+        normal_name, _ = _required_source(
+            object_fd,
+            config.normal_filenames[0],
+            split=split,
+            object_name=object_name,
+            role="ground truth",
+        )
+        mask_name, _ = _required_source(
+            object_fd,
+            config.external_mask_filename,
+            split=split,
+            object_name=object_name,
+            role="external mask",
+        )
+        final_sources = _source_entries(
+            object_fd,
+            split=split,
+            object_name=object_name,
+            config=config,
+        )
+        if final_sources != observations:
+            _raise_failure(
+                split,
+                object_name,
+                "<observations>",
+                "observation allowlist changed while indexing",
+            )
+        try:
+            assert_directory_path_identity(
+                object_path,
+                {"dev": object_identity[0], "ino": object_identity[1]},
+                label=f"object {object_name}",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _contextualize(split, object_name, mask_name, exc) from exc
+        height, width = config.expected_source_geometry
+        return PrivateSourceIndexRecord(
+            name=object_name,
+            relative_dir=object_name,
+            height=int(height),
+            width=int(width),
+            observation_files=tuple(name for name, _ in observations),
+            normal_file=normal_name,
+            mask_file=mask_name,
+        )
+    finally:
+        try:
+            os.close(object_fd)
+        except OSError:
+            pass
 
 
 def _decoded_rgb(
@@ -842,6 +970,148 @@ def build_private_split_manifest(
             pass
 
 
+def build_private_split_index(
+    config: PrivateTrainConfig,
+    split: str,
+) -> PrivateSplitIndex:
+    """Build a deterministic filename-only index without reading EXR bytes."""
+
+    split_name, root, data_root, expected_root = _split_root(config, split)
+    root_fd, root_identity = _open_root(root, expected_root, split=split_name)
+    try:
+        objects = _object_entries(
+            root_fd,
+            root,
+            root_identity,
+            config,
+            split=split_name,
+        )
+        records: list[PrivateSourceIndexRecord] = []
+        total = len(objects)
+        interval = config.source_validation.progress_every_objects
+        for completed, (object_name, object_identity) in enumerate(objects, start=1):
+            records.append(
+                _build_source_index_record(
+                    root_fd,
+                    root_identity,
+                    object_name,
+                    object_identity,
+                    root,
+                    config,
+                    split=split_name,
+                )
+            )
+            if completed % interval == 0 or completed == total:
+                print(f"Indexed {completed}/{total} {split_name} objects")
+
+        _assert_root_fd(
+            root_fd,
+            root_identity,
+            split=split_name,
+            object_name="<root>",
+            filename="<object-directory>",
+        )
+        final_names = _descriptor_names(
+            root_fd,
+            split=split_name,
+            object_name="<root>",
+            filename="<object-directory>",
+        )
+        final_objects = tuple(
+            sorted(name for name in final_names if name.endswith(config.object_suffix))
+        )
+        expected_objects = tuple(name for name, _ in objects)
+        if len(set(final_objects)) != len(final_objects):
+            _raise_failure(
+                split_name,
+                "<root>",
+                "<object-directory>",
+                "object names must be unique",
+            )
+        if final_objects != expected_objects:
+            _raise_failure(
+                split_name,
+                "<root>",
+                "<object-directory>",
+                "object directory allowlist changed",
+            )
+        for object_name, object_expected in objects:
+            try:
+                info = os.stat(object_name, dir_fd=root_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise _contextualize(
+                    split_name, object_name, "<object-directory>", exc
+                ) from exc
+            actual = (int(info.st_dev), int(info.st_ino))
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                _raise_failure(
+                    split_name,
+                    object_name,
+                    "<object-directory>",
+                    "object directory changed type",
+                )
+            if actual != object_expected:
+                _raise_failure(
+                    split_name,
+                    object_name,
+                    "<object-directory>",
+                    "object directory identity changed",
+                )
+        try:
+            assert_directory_path_identity(
+                root,
+                {"dev": root_identity[0], "ino": root_identity[1]},
+                label=f"{split_name} data root",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise _contextualize(split_name, "<root>", "<root>", exc) from exc
+
+        return PrivateSplitIndex(
+            version=2,
+            split=split_name,
+            data_root=data_root,
+            objects=tuple(records),
+            structural_index_version=config.source_validation.structural_index_version,
+            object_suffix=config.object_suffix,
+            image_prefix=config.image_prefix,
+            image_extension=config.image_extension,
+            normal_encoding=config.normal_encoding,
+            expected_source_geometry=tuple(config.expected_source_geometry),
+            mask_policy=config.mask_policy,
+            max_image_num=int(config.max_image_num),
+            light_selection=config.light_selection,
+            seed=int(config.seed),
+        )
+    finally:
+        try:
+            os.close(root_fd)
+        except OSError:
+            pass
+
+
+def private_index_bytes(index: PrivateSplitIndex) -> bytes:
+    """Serialize one structural index as canonical compact JSON."""
+
+    if not isinstance(index, PrivateSplitIndex):
+        raise TypeError("index must be a PrivateSplitIndex")
+    return (
+        json.dumps(
+            asdict(index),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def private_index_sha256(index: PrivateSplitIndex) -> str:
+    """Return the digest of the exact canonical structural-index bytes."""
+
+    return hashlib.sha256(private_index_bytes(index)).hexdigest()
+
+
 def private_manifest_bytes(manifest: PrivateSplitManifest) -> bytes:
     """Serialize one manifest using canonical compact JSON and a final newline."""
 
@@ -867,10 +1137,15 @@ def private_manifest_sha256(manifest: PrivateSplitManifest) -> str:
 
 __all__ = [
     "PrivateSourceSnapshot",
+    "PrivateSourceIndexRecord",
+    "PrivateSplitIndex",
     "PrivateObjectRecord",
     "PrivateSplitManifest",
     "build_private_split_manifest",
+    "build_private_split_index",
     "open_private_source_snapshot",
     "private_manifest_bytes",
     "private_manifest_sha256",
+    "private_index_bytes",
+    "private_index_sha256",
 ]

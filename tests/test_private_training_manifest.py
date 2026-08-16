@@ -108,6 +108,100 @@ class PrivateTrainingManifestTests(unittest.TestCase):
         write_mask_exr(object_dir / "binary_mask.exr", mask)
         return object_dir
 
+    def test_structural_index_never_reads_or_decodes_source_contents(self):
+        self._write_object("alpha.data")
+        blocked = AssertionError("structural indexing must not read EXR contents")
+        with (
+            mock.patch.object(private_manifest, "_snapshot", side_effect=blocked),
+            mock.patch.object(
+                private_manifest, "read_regular_bytes_at_fd", side_effect=blocked
+            ),
+            mock.patch.object(
+                private_manifest, "read_rgb_exr_bytes", side_effect=blocked
+            ),
+            mock.patch.object(
+                private_manifest, "read_mask_exr_bytes", side_effect=blocked
+            ),
+            mock.patch.object(
+                private_manifest, "decode_ground_truth_normal", side_effect=blocked
+            ),
+        ):
+            index = private_manifest.build_private_split_index(
+                self.config(), split="train"
+            )
+
+        self.assertEqual(index.version, 2)
+        self.assertEqual([record.name for record in index.objects], ["alpha.data"])
+
+    def test_structural_index_records_only_names_and_declared_geometry(self):
+        self._write_object(
+            "zeta.data",
+            observation_names=[
+                "image10.exr",
+                "image2.exr",
+                "image1.exr",
+                "image3.exr",
+                "image4.exr",
+                "image5.exr",
+                "image6.exr",
+                "image7.exr",
+            ],
+        )
+        index = private_manifest.build_private_split_index(self.config(), "train")
+        record = index.objects[0]
+
+        self.assertEqual(record.name, "zeta.data")
+        self.assertEqual(record.relative_dir, "zeta.data")
+        self.assertEqual((record.height, record.width), (256, 256))
+        self.assertEqual(
+            record.observation_files,
+            (
+                "image1.exr",
+                "image10.exr",
+                "image2.exr",
+                "image3.exr",
+                "image4.exr",
+                "image5.exr",
+                "image6.exr",
+                "image7.exr",
+            ),
+        )
+        self.assertEqual(record.normal_file, "local_normal.exr")
+        self.assertEqual(record.mask_file, "binary_mask.exr")
+
+    def test_structural_index_digest_ignores_same_name_byte_changes(self):
+        object_dir = self._write_object("alpha.data")
+        first = private_manifest.build_private_split_index(self.config(), "train")
+        first_digest = private_manifest.private_index_sha256(first)
+        write_rgb_exr(
+            object_dir / "image_00.exr",
+            np.full((17, 19, 3), 99.0, dtype=np.float32),
+        )
+        second = private_manifest.build_private_split_index(self.config(), "train")
+
+        self.assertEqual(first_digest, private_manifest.private_index_sha256(second))
+        self.assertEqual(
+            first_digest,
+            hashlib.sha256(private_manifest.private_index_bytes(first)).hexdigest(),
+        )
+
+    def test_structural_index_rejects_symlink_and_insufficient_observations(self):
+        object_dir = self._write_object("alpha.data")
+        target = self.root / "outside-image.exr"
+        target.write_bytes((object_dir / "image_00.exr").read_bytes())
+        (object_dir / "image_00.exr").unlink()
+        os.symlink(target, object_dir / "image_00.exr")
+        with self.assertRaisesRegex(ValueError, "symlink|regular"):
+            private_manifest.build_private_split_index(self.config(), "train")
+
+        shutil.rmtree(object_dir)
+        self._write_object(
+            "alpha.data",
+            observation_names=[f"image_{index:02d}.exr" for index in range(5)],
+        )
+        with self.assertRaisesRegex(ValueError, "only 5.*6|requires 6"):
+            private_manifest.build_private_split_index(self.config(), "train")
+
     def test_manifest_indexes_every_observation_in_sdm_lexicographic_order(self):
         self._write_object(
             "zeta.data",
