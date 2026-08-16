@@ -22,6 +22,13 @@ training entry point. The primary experiment is a cold start for 100 total
 epochs; no official accuracy result exists until that run and its paired
 inference have actually completed.
 
+The native 512 route can exceed a 23.54 GiB GPU even with batch size one and
+activation checkpointing. A separate **LINO-256** route is therefore provided.
+It keeps the same parameter architecture but uses internal/canonical geometry
+256/128. The 2:1 ratio preserves LINO's four wavelet/token groups; do not
+change it to 256/256. Report this result as LINO-256, not author-native
+LINO-512.
+
 ### Install and verify the training inputs
 
 Run these commands from the LINO checkout. Use the LINO environment, not the
@@ -82,6 +89,19 @@ contract, so changing it requires a new cold-start/initialization run rather
 than silently continuing an incompatible runtime contract. A successful first
 optimizer step on the target GPU is still required to establish whether the
 23 GiB device is large enough.
+
+If the 512 command still raises CUDA OOM, use the isolated LINO-256 preset:
+
+```bash
+python train_private.py --config configs/lino_private_train_256_fixed.yaml
+```
+
+This keeps six seeded lights, batch size one, pixel budget 4096, BF16,
+activation checkpointing, optimizer, scheduler, and data/mask contracts. It
+changes only the versioned model geometry and writes to
+`runs/lino_private_256_fixed_lazy_sdmvalid_bf16/`, so it cannot overwrite the
+512 experiment. Reducing 512x512 to 256x256 cuts the spatial working set by
+about four; attention memory may fall by more because of token-pair scaling.
 
 Startup uses a filename-only structural index. It checks safe object and file
 names but does not decode or hash the complete EXR dataset before CUDA is
@@ -199,6 +219,17 @@ the model. It writes signed 256x256 predictions under
 MAE, and CUDA memory. `run.json` is created only after every selected object
 finishes successfully; a missing `run.json` means the inference run is partial
 or failed. Do not create it manually.
+
+For a completed LINO-256 run, use only its matching inference preset:
+
+```bash
+python eval.py --config configs/lino_private_infer_trained_256_fixed.yaml
+```
+
+It validates the 256/128 training contract and writes below the separate
+`output/lino_private_256_trained_lazy_sdmvalid/` root. A 512 export is rejected
+by this preset's sidecar gate, and a LINO-256 export is rejected by the older
+512 preset.
 
 ### Short manual GPU smoke gate (non-comparable)
 

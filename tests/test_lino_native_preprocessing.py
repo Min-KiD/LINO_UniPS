@@ -48,6 +48,27 @@ class LinoNativePreprocessingTests(unittest.TestCase):
             )
         )
 
+    def test_private_256_version_resizes_all_model_fields_to_256(self):
+        target_mask = np.zeros_like(self.mask)
+        target_mask[2:4, 2:6] = 1
+        normal = np.zeros((*target_mask.shape, 3), dtype=np.float32)
+        normal[..., 2] = target_mask
+
+        result = prepare_lino_native_geometry(
+            self.images,
+            self.mask,
+            target_normal=normal,
+            target_mask=target_mask,
+            margin=0,
+            target_resolution=256,
+            preprocessing_version="private_external_lino_256_v2",
+        )
+
+        self.assertEqual(result.images.shape, (256, 256, 3, 2))
+        self.assertEqual(result.model_mask.shape, (256, 256))
+        self.assertEqual(result.target_normal.shape, (256, 256, 3))
+        self.assertEqual(result.target_mask.shape, (256, 256))
+
     def test_target_support_outside_model_mask_is_rejected_before_resize(self):
         target_mask = np.zeros_like(self.mask)
         target_mask[0, 0] = 1

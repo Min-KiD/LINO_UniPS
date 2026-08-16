@@ -49,16 +49,17 @@ _TENSOR_FIELDS = (
     "source_model_mask",
     "roi",
 )
-_FIELD_CONTRACT: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
-    "imgs": ((3, 512, 512, 6), torch.float32),
-    "model_mask": ((1, 512, 512), torch.float32),
-    "target_normal": ((3, 512, 512), torch.float32),
-    "target_mask": ((1, 512, 512), torch.float32),
-    "source_target_normal": ((3, 256, 256), torch.float32),
-    "source_target_mask": ((1, 256, 256), torch.float32),
-    "source_model_mask": ((1, 256, 256), torch.float32),
-    "roi": ((6,), torch.int64),
-}
+def _field_contract(model_side: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    return {
+        "imgs": ((3, model_side, model_side, 6), torch.float32),
+        "model_mask": ((1, model_side, model_side), torch.float32),
+        "target_normal": ((3, model_side, model_side), torch.float32),
+        "target_mask": ((1, model_side, model_side), torch.float32),
+        "source_target_normal": ((3, 256, 256), torch.float32),
+        "source_target_mask": ((1, 256, 256), torch.float32),
+        "source_model_mask": ((1, 256, 256), torch.float32),
+        "roi": ((6,), torch.int64),
+    }
 
 
 def _safe_basename(value: Any) -> bool:
@@ -455,9 +456,16 @@ def collate_private_exr(samples: list[dict[str, Any]]) -> dict[str, Any]:
     for sample_index, sample in enumerate(samples):
         if not isinstance(sample["metadata"], Mapping):
             raise ValueError(f"metadata must be a mapping in private EXR sample {sample_index}")
+        images = sample["imgs"]
+        if not isinstance(images, torch.Tensor) or images.ndim != 4:
+            raise ValueError(f"imgs has invalid shape in private EXR sample {sample_index}")
+        model_side = int(images.shape[1])
+        if model_side not in {256, 512} or int(images.shape[2]) != model_side:
+            raise ValueError(f"imgs has invalid model geometry in private EXR sample {sample_index}")
+        field_contract = _field_contract(model_side)
         for field in _TENSOR_FIELDS:
             value = sample[field]
-            expected_shape, expected_dtype = _FIELD_CONTRACT[field]
+            expected_shape, expected_dtype = field_contract[field]
             if not isinstance(value, torch.Tensor):
                 raise ValueError(f"{field} must be a Tensor in private EXR sample {sample_index}")
             if tuple(value.shape) != expected_shape:

@@ -451,7 +451,11 @@ def _production_schema_provider(config: PrivateTrainConfig):
     torch.linspace = _cpu_linspace  # type: ignore[assignment]
     try:
         with torch.device("meta"):
-            model = LiNo_UniPS(pixel_samples=config.pixel_samples)
+            model = LiNo_UniPS(
+                pixel_samples=config.pixel_samples,
+                model_resolution=config.max_image_resolution,
+                canonical_resolution=config.canonical_resolution,
+            )
     finally:
         torch.linspace = original_linspace  # type: ignore[assignment]
     return tuple((name, tuple(tensor.shape), str(tensor.dtype)) for name, tensor in model.state_dict().items())
@@ -460,7 +464,11 @@ def _production_schema_provider(config: PrivateTrainConfig):
 def _production_model_factory(config: PrivateTrainConfig) -> torch.nn.Module:
     from src.models.Net_module import LiNo_UniPS
 
-    return LiNo_UniPS(pixel_samples=config.pixel_samples)
+    return LiNo_UniPS(
+        pixel_samples=config.pixel_samples,
+        model_resolution=config.max_image_resolution,
+        canonical_resolution=config.canonical_resolution,
+    )
 
 
 def _runtime_versions() -> dict[str, object]:

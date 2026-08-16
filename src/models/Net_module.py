@@ -16,10 +16,18 @@ from datetime import datetime
 class LiNo_UniPS(pl.LightningModule):
     def __init__(self, 
                  pixel_samples: int = 2048,
-                 task_name :str = None):
+                 task_name :str = None,
+                 model_resolution: int = 512,
+                 canonical_resolution: int = 256):
         super().__init__()
+        if (model_resolution, canonical_resolution) not in {(512, 256), (256, 128)}:
+            raise ValueError(
+                "LiNo_UniPS runtime geometry must be model/canonical 512/256 or 256/128"
+            )
         self.pixel_samples = pixel_samples
         self.task_name = task_name
+        self.model_resolution = int(model_resolution)
+        self.canonical_resolution = int(canonical_resolution)
         self.input_dim = 4 
         self.image_encoder = ScaleInvariantSpatialLightImageEncoder(self.input_dim, use_efficient_attention=False) 
         self.input_dim = 0 
@@ -173,7 +181,12 @@ class LiNo_UniPS(pl.LightningModule):
         # roi = batch.get("roi",None)
         B, C, H, W, Nmax = I.shape
 
-        patch_size = 512               
+        patch_size = self.model_resolution
+        if H < patch_size or W < patch_size:
+            raise ValueError(
+                f"model input geometry {(H, W)} is smaller than the configured "
+                f"LINO tile {patch_size}"
+            )
         patches_I = decompose_tensors.divide_tensor_spatial(I.permute(0,4,1,2,3).reshape(-1, C, H, W), block_size=patch_size, method='tile_stride')
         patches_I = patches_I.reshape(B, Nmax, -1, C, patch_size, patch_size).permute(0, 2, 3, 4, 5, 1)
         sliding_blocks = patches_I.shape[1]
@@ -181,7 +194,7 @@ class LiNo_UniPS(pl.LightningModule):
         patches_nml = []
 
         nImgArray = np.array([Nmax])
-        canonical_resolution = 256
+        canonical_resolution = self.canonical_resolution
         for k in range(sliding_blocks):
             """ Image Encoder at Canonical Resolution """
             I = patches_I[:, k, :, :, :, :] 

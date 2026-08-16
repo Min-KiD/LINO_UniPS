@@ -123,13 +123,18 @@ class SdmExrInferenceConfig:
             raise ValueError("mask_policy must be one of: external, full")
         if self.normal_encoding not in {"signed", "unsigned"}:
             raise ValueError("normal_encoding must be one of: signed, unsigned")
+        private_versions = {
+            "private_external_lino_native_v1",
+            "private_external_lino_256_v2",
+        }
         if self.preprocessing_version not in {
             "released_transfer_v1",
-            "private_external_lino_native_v1",
+            *private_versions,
         }:
             raise ValueError(
                 "preprocessing_version must be one of: "
-                "released_transfer_v1, private_external_lino_native_v1"
+                "released_transfer_v1, private_external_lino_native_v1, "
+                "private_external_lino_256_v2"
             )
         _require_bool(
             self.require_checkpoint_data_contract,
@@ -141,41 +146,45 @@ class SdmExrInferenceConfig:
         )
         if (
             self.require_checkpoint_data_contract
-            and self.preprocessing_version != "private_external_lino_native_v1"
+            and self.preprocessing_version not in private_versions
         ):
             raise ValueError(
                 "require_checkpoint_data_contract requires "
-                "private_external_lino_native_v1"
+                "a private LINO preprocessing version"
             )
-        if self.preprocessing_version == "private_external_lino_native_v1":
+        if self.preprocessing_version in private_versions:
             if not self.require_checkpoint_data_contract:
                 raise ValueError(
-                    "private_external_lino_native_v1 requires "
+                    f"{self.preprocessing_version} requires "
                     "require_checkpoint_data_contract"
                 )
             if self.light_selection != "manifest":
                 raise ValueError(
-                    "private_external_lino_native_v1 requires manifest light_selection"
+                    f"{self.preprocessing_version} requires manifest light_selection"
                 )
             if self.max_image_num != 16:
                 raise ValueError(
-                    "private_external_lino_native_v1 requires max_image_num 16"
+                    f"{self.preprocessing_version} requires max_image_num 16"
                 )
             if self.mask_policy != "external":
                 raise ValueError(
-                    "private_external_lino_native_v1 requires external mask_policy"
+                    f"{self.preprocessing_version} requires external mask_policy"
                 )
             if self.normal_encoding != "unsigned":
                 raise ValueError(
-                    "private_external_lino_native_v1 requires unsigned normal_encoding"
+                    f"{self.preprocessing_version} requires unsigned normal_encoding"
                 )
             if self.expected_source_geometry != (256, 256):
                 raise ValueError(
-                    "private_external_lino_native_v1 requires source geometry [256, 256]"
+                    f"{self.preprocessing_version} requires source geometry [256, 256]"
                 )
-            if self.max_image_resolution != 512:
+            expected_resolution = (
+                256 if self.preprocessing_version == "private_external_lino_256_v2" else 512
+            )
+            if self.max_image_resolution != expected_resolution:
                 raise ValueError(
-                    "private_external_lino_native_v1 requires internal resolution 512"
+                    f"{self.preprocessing_version} requires internal resolution "
+                    f"{expected_resolution}"
                 )
         if self.expected_source_geometry is not None:
             if (
@@ -203,8 +212,11 @@ class SdmExrInferenceConfig:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative")
         resolution = _require_int(self.max_image_resolution, "max_image_resolution")
-        if resolution < 512 or resolution % 512:
-            raise ValueError("max_image_resolution must be at least 512 and divisible by 512")
+        if self.preprocessing_version == "released_transfer_v1":
+            if resolution < 512 or resolution % 512:
+                raise ValueError(
+                    "max_image_resolution must be at least 512 and divisible by 512"
+                )
         _require_int(self.seed, "seed")
 
         if not isinstance(self.normal_filenames, tuple) or not self.normal_filenames:

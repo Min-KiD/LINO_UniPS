@@ -322,6 +322,39 @@ class PrivateTrainingConfigTests(unittest.TestCase):
                 raw[key] = value
                 load_private_train_config(self._write_yaml(raw))
 
+    def test_lino_256_contract_accepts_only_the_256_128_geometry_pair(self):
+        raw = self.valid_mapping()
+        raw.update(
+            preprocessing_version="private_external_lino_256_v2",
+            max_image_resolution=256,
+            canonical_resolution=128,
+        )
+        config = load_private_train_config(self._write_yaml(raw))
+        self.assertEqual(config.max_image_resolution, 256)
+        self.assertEqual(config.canonical_resolution, 128)
+
+        for field, value in (
+            ("max_image_resolution", 512),
+            ("canonical_resolution", 256),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "private LINO geometry"
+            ):
+                invalid = dict(raw)
+                invalid[field] = value
+                load_private_train_config(self._write_yaml(invalid))
+
+    def test_checked_in_lino_256_training_preset_is_isolated_and_low_memory(self):
+        preset = Path(__file__).resolve().parents[1] / "configs/lino_private_train_256_fixed.yaml"
+        config = load_private_train_config(preset)
+        self.assertEqual(config.preprocessing_version, "private_external_lino_256_v2")
+        self.assertEqual((config.max_image_resolution, config.canonical_resolution), (256, 128))
+        self.assertEqual(config.max_image_num, 6)
+        self.assertEqual(config.train_batch_size, 1)
+        self.assertEqual(config.train_pixel_budget, 4096)
+        self.assertTrue(config.activation_checkpointing)
+        self.assertIn("lino_private_256", str(config.save_dir))
+
     def test_positive_and_nonnegative_numeric_checks(self):
         for key, value in (
             ("mask_margin", -1),

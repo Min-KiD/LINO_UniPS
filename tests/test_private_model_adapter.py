@@ -215,6 +215,24 @@ class PrivateModelAdapterTests(unittest.TestCase):
                 self.assertTrue(torch.isfinite(chunk.prediction).all())
                 self.assertTrue(torch.allclose(chunk.prediction.norm(dim=-1), torch.ones(chunk.prediction.shape[0]), atol=1e-5))
 
+    def test_adapter_accepts_lino_256_with_canonical_128(self):
+        model = _FakeReleasedLino()
+        images = torch.linspace(0.0, 1.0, 3 * 256 * 256 * 6).reshape(
+            1, 3, 256, 256, 6
+        )
+        mask = torch.ones(1, 1, 256, 256)
+
+        encoded = encode_private_batch(
+            model,
+            images,
+            mask,
+            canonical_resolution=128,
+        )
+
+        self.assertEqual(tuple(model.image_encoder.last_images.shape), (6, 3, 256, 256))
+        self.assertEqual(model.image_encoder.last_canonical_resolution, 128)
+        self.assertEqual(tuple(encoded.glc.shape[-2:]), (256, 256))
+
     def test_loss_backpropagates_to_all_used_released_components(self):
         model = _FakeReleasedLino()
         encoded = encode_private_batch(model, self.images(), self.model_mask(), canonical_resolution=256)
@@ -351,6 +369,19 @@ class PrivateModelAdapterTests(unittest.TestCase):
                 for name, _shape, _dtype in schema
             )
         )
+
+    def test_lino_256_runtime_geometry_does_not_change_released_state_schema(self):
+        with _released_model_with_dependency_stubs() as LiNo_UniPS:
+            with torch.device("meta"):
+                native = LiNo_UniPS(pixel_samples=2048)
+                lino_256 = LiNo_UniPS(
+                    pixel_samples=2048,
+                    model_resolution=256,
+                    canonical_resolution=128,
+                )
+        self.assertEqual(released_state_schema(native), released_state_schema(lino_256))
+        self.assertEqual(lino_256.model_resolution, 256)
+        self.assertEqual(lino_256.canonical_resolution, 128)
 
     def test_cuda_dtype_bridge_is_internal_to_encoder_and_decoder(self):
         model = _DtypeSensitiveReleasedLino()

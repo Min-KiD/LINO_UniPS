@@ -228,6 +228,23 @@ class PrivateExrTrainDatasetTests(unittest.TestCase):
                 self.assertEqual(sample[name].dtype, dtype)
                 self.assertTrue(sample[name].is_contiguous())
 
+    def test_lino_256_sample_and_collator_preserve_source_geometry(self):
+        config = self.config(
+            preprocessing_version="private_external_lino_256_v2",
+            max_image_resolution=256,
+            canonical_resolution=128,
+        )
+        self._write_object(self.train_root, "alpha.data")
+        index = build_private_split_index(config, "train")
+        sample = PrivateExrTrainDataset(config, index, split="train")[0]
+
+        self.assertEqual(tuple(sample["imgs"].shape), (3, 256, 256, 6))
+        self.assertEqual(tuple(sample["model_mask"].shape), (1, 256, 256))
+        self.assertEqual(tuple(sample["target_normal"].shape), (3, 256, 256))
+        self.assertEqual(sample["metadata"]["resized_geometry"], {"height": 256, "width": 256})
+        batch = collate_private_exr([sample])
+        self.assertEqual(tuple(batch["imgs"].shape), (1, 3, 256, 256, 6))
+
     def test_train_selection_and_normalization_vary_by_epoch(self):
         config, manifest = self.manifest()
         dataset = PrivateExrTrainDataset(config, manifest, split="train")

@@ -25,6 +25,8 @@ from src.comparison.manifest import DatasetManifest, ObjectRecord
 from src.comparison.provenance import sha256_bytes
 from .data_module import get_roi
 from .lino_native_preprocessing import (
+    PRIVATE_256_VERSION,
+    PRIVATE_EXTERNAL_VERSION,
     RELEASED_TRANSFER_VERSION,
     _normalization_seed,
     normalize_lino_observations,
@@ -269,14 +271,23 @@ class SdmExrDataset(Dataset):
         cropped_height = row_end - row_start
         cropped_width = col_end - col_start
         long_side = max(cropped_height, cropped_width)
-        target = max(
-            512,
-            min(
-                int(self.config.max_image_resolution),
-                (long_side // 512) * 512,
-            ),
-        )
-        if target <= 0 or target % 512:
+        if self.config.preprocessing_version in {
+            PRIVATE_EXTERNAL_VERSION,
+            PRIVATE_256_VERSION,
+        }:
+            target = int(self.config.max_image_resolution)
+        else:
+            target = max(
+                512,
+                min(
+                    int(self.config.max_image_resolution),
+                    (long_side // 512) * 512,
+                ),
+            )
+        if target <= 0 or (
+            self.config.preprocessing_version == RELEASED_TRANSFER_VERSION
+            and target % 512
+        ):
             raise ValueError(f"resized geometry is invalid for {record.name}: {target}")
         geometry = prepare_lino_native_geometry(
             np.stack(images, axis=-1),

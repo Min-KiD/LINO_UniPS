@@ -1,0 +1,47 @@
+# Low-memory LINO-256 cold-start training preset for the private EXR dataset.
+# This is a separate experiment from the author-native 512/256 LINO route.
+
+train_dir: "/mnt/18TData/minhnv/train"
+test_dir: "/mnt/18TData/minhnv/test"
+save_dir: "./runs/lino_private_256_fixed_lazy_sdmvalid_bf16"
+startup_mode: "cold_start"
+init_checkpoint: null
+resume_checkpoint: null
+final_selection_manifest: null
+object_suffix: ".data"
+image_prefix: "image"
+image_extension: ".exr"
+normal_filenames: ["local_normal.exr"]
+external_mask_filename: "binary_mask.exr"
+normal_encoding: "unsigned"
+expected_source_geometry: [256, 256]
+mask_policy: "external"
+mask_margin: 8
+max_image_num: 6
+light_selection: "seeded"
+seed: 20260710
+preprocessing_version: "private_external_lino_256_v2"
+max_image_resolution: 256
+canonical_resolution: 128
+pixel_samples: 2048
+train_pixel_budget: 4096
+activation_checkpointing: true
+precision: "bf16"
+device: "cuda"
+deterministic: false
+epochs: 100
+train_batch_size: 1
+train_workers: 8
+test_workers: 4
+learning_rate: 0.00005
+weight_decay: 0.05
+adamw_betas: [0.9, 0.98]
+scheduler_step_size: 3
+scheduler_gamma: 0.8
+save_every_epochs: 1
+keep_milestone_epochs: [25, 50, 75, 100]
+source_validation:
+  mode: "lazy"
+  structural_index_version: "private_exr_index_v1"
+  persistent_content_ledger: false
+  progress_every_objects: 0

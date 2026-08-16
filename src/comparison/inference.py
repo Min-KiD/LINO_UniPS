@@ -23,6 +23,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from src.lino_geometry import private_lino_geometry
+
 from .config import SdmExrInferenceConfig
 from .exr_io import (
     encode_normal_exr,
@@ -265,7 +267,7 @@ def _validate_trained_export_sidecar(
         raise ValueError("LINO sidecar source geometry does not match inference config")
     expected_snapshot = {
         "max_image_resolution": config.max_image_resolution,
-        "canonical_resolution": 256,
+        "canonical_resolution": private_lino_geometry(config.preprocessing_version)[1],
         "mask_policy": "external",
         "normal_encoding": "unsigned",
         "external_mask_filename": config.external_mask_filename,
@@ -398,7 +400,20 @@ def load_local_lino_checkpoint(
     # or device transfer, so an artifact checkpoint cannot allocate the model.
     from src.models.Net_module import LiNo_UniPS
 
-    model = LiNo_UniPS(pixel_samples=config.pixel_samples, task_name="SDM_EXR")
+    if config.require_checkpoint_data_contract:
+        model_resolution, canonical_resolution = private_lino_geometry(
+            config.preprocessing_version
+        )
+        model = LiNo_UniPS(
+            pixel_samples=config.pixel_samples,
+            task_name="SDM_EXR",
+            model_resolution=model_resolution,
+            canonical_resolution=canonical_resolution,
+        )
+    else:
+        # Preserve the released loader's exact constructor call. The model's
+        # default runtime geometry remains 512/256.
+        model = LiNo_UniPS(pixel_samples=config.pixel_samples, task_name="SDM_EXR")
 
     # Match the author's released loaders in ``hubconf.py`` and
     # ``LiNo_UniPS.from_pretrained`` for the default route.  The paired private

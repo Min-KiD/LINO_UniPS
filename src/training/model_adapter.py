@@ -22,7 +22,7 @@ from src.models.utils.gauss_filter import gauss_filter
 
 _EXPECTED_CHANNELS = 3
 _EXPECTED_LIGHTS = 6
-_EXPECTED_SIDE = 512
+_SUPPORTED_GEOMETRIES = frozenset({(512, 256), (256, 128)})
 _SMOOTHING_SIGMA = 1
 _SMOOTHING_SCALE = 10
 _DECODE_CHUNK = 16
@@ -134,16 +134,16 @@ def _validate_encoder_inputs(
     if observations.dtype != torch.float32:
         raise TypeError("observations must have dtype torch.float32")
     if observations.ndim != 5:
-        raise ValueError("observations must have shape [B, 3, 512, 512, 6]")
+        raise ValueError("observations must have shape [B, 3, S, S, 6]")
     batch, channels, height, width, lights = observations.shape
-    if channels != _EXPECTED_CHANNELS or height != _EXPECTED_SIDE or width != _EXPECTED_SIDE:
-        raise ValueError("observations must have shape [B, 3, 512, 512, 6]")
+    if channels != _EXPECTED_CHANNELS or height != width:
+        raise ValueError("observations must have shape [B, 3, S, S, 6]")
     if lights != _EXPECTED_LIGHTS:
         raise ValueError("private adapter requires exactly six lights per object")
     if batch <= 0:
         raise ValueError("observations must contain at least one object")
     if model_mask.ndim != 4 or tuple(model_mask.shape) != (batch, 1, height, width):
-        raise ValueError("model_mask must have shape [B, 1, 512, 512]")
+        raise ValueError("model_mask must have shape [B, 1, S, S]")
     if model_mask.device != observations.device:
         raise ValueError("observations and model_mask must be on the same device")
     if model_mask.dtype not in (torch.float32, torch.bool):
@@ -159,8 +159,10 @@ def _validate_encoder_inputs(
     if not isinstance(canonical_resolution, Integral) or isinstance(canonical_resolution, bool):
         raise TypeError("canonical_resolution must be an integer")
     canonical_resolution = int(canonical_resolution)
-    if canonical_resolution <= 0 or height % canonical_resolution != 0:
-        raise ValueError("canonical_resolution must be a positive divisor of 512")
+    if (height, canonical_resolution) not in _SUPPORTED_GEOMETRIES:
+        raise ValueError(
+            "private adapter geometry must be internal/canonical 512/256 or 256/128"
+        )
     return batch, height, width
 
 
@@ -238,7 +240,7 @@ def encode_private_batch(
     if glc.ndim != 4:
         raise ValueError("image_encoder GLC output must have shape [B*6, C, H, W]")
     if glc.shape[0] != batch * _EXPECTED_LIGHTS or tuple(glc.shape[-2:]) != (height, width):
-        raise ValueError("image_encoder GLC output must preserve object/light and 512x512 geometry")
+        raise ValueError("image_encoder GLC output must preserve object/light and input geometry")
     if glc.shape[1] <= 0:
         raise ValueError("image_encoder GLC output must have channels")
     _require_finite(glc, "image_encoder GLC output")

@@ -10,6 +10,8 @@ from typing import Any, Mapping, cast
 
 import yaml
 
+from src.lino_geometry import private_lino_geometry
+
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
@@ -201,12 +203,18 @@ class PrivateTrainConfig:
             raise ValueError("max_image_num must be 6")
         if self.light_selection != "seeded":
             raise ValueError("light_selection must be seeded")
-        if self.preprocessing_version != "private_external_lino_native_v1":
+        try:
+            expected_geometry = private_lino_geometry(self.preprocessing_version)
+        except ValueError as exc:
             raise ValueError(
-                "preprocessing_version must be private_external_lino_native_v1"
+                "preprocessing_version must be private_external_lino_native_v1 "
+                "or private_external_lino_256_v2"
+            ) from exc
+        if (self.max_image_resolution, self.canonical_resolution) != expected_geometry:
+            raise ValueError(
+                "private LINO geometry must match preprocessing_version: "
+                f"internal {expected_geometry[0]} and canonical {expected_geometry[1]}"
             )
-        if (self.max_image_resolution, self.canonical_resolution) != (512, 256):
-            raise ValueError("private LINO geometry must be internal 512 and canonical 256")
 
         nonnegative_ints = ("mask_margin", "seed", "train_workers", "test_workers")
         for field_name in nonnegative_ints:

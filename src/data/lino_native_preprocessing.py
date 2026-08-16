@@ -17,12 +17,17 @@ import numpy as np
 
 from src.comparison.manifest import stable_seed as legacy_manifest_seed
 from src.data.data_module import get_roi
+from src.lino_geometry import (
+    PRIVATE_256_VERSION,
+    PRIVATE_EXTERNAL_VERSION,
+    PRIVATE_LINO_GEOMETRIES,
+    private_lino_geometry,
+)
 from src.training.reproducibility import stable_seed
 
 
 RELEASED_TRANSFER_VERSION = "released_transfer_v1"
-PRIVATE_EXTERNAL_VERSION = "private_external_lino_native_v1"
-_SUPPORTED_VERSIONS = frozenset({RELEASED_TRANSFER_VERSION, PRIVATE_EXTERNAL_VERSION})
+_SUPPORTED_VERSIONS = frozenset({RELEASED_TRANSFER_VERSION, *PRIVATE_LINO_GEOMETRIES})
 
 
 @dataclass(frozen=True)
@@ -112,12 +117,12 @@ def _validate_roi(roi: np.ndarray, *, source_shape: tuple[int, int]) -> np.ndarr
 def _validate_resolution(target_resolution: int, *, version: str) -> int:
     if isinstance(target_resolution, bool) or not isinstance(target_resolution, int):
         raise ValueError("target_resolution must be an integer")
-    if target_resolution < 512 or target_resolution % 512:
+    if version in PRIVATE_LINO_GEOMETRIES:
+        expected, _canonical = private_lino_geometry(version)
+        if target_resolution != expected:
+            raise ValueError(f"{version} requires target_resolution {expected}")
+    elif target_resolution < 512 or target_resolution % 512:
         raise ValueError("target_resolution must be at least 512 and divisible by 512")
-    if version == PRIVATE_EXTERNAL_VERSION and target_resolution != 512:
-        raise ValueError(
-            "private_external_lino_native_v1 requires target_resolution 512"
-        )
     return target_resolution
 
 
@@ -402,7 +407,11 @@ def restore_lino_prediction(
 __all__ = [
     "NormalizedLinoObservations",
     "PreparedLinoGeometry",
+    "PRIVATE_256_VERSION",
+    "PRIVATE_EXTERNAL_VERSION",
+    "RELEASED_TRANSFER_VERSION",
     "normalize_lino_observations",
+    "private_lino_geometry",
     "prepare_lino_native_geometry",
     "restore_lino_prediction",
 ]

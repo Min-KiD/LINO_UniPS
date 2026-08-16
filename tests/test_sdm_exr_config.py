@@ -184,6 +184,19 @@ class SdmExrConfigTests(unittest.TestCase):
         self.assertEqual(config.max_image_resolution, 512)
         self.assertEqual(config.normal_encoding, "unsigned")
 
+    def test_trained_lino_256_preset_pins_the_matching_geometry_and_artifacts(self):
+        from src.comparison.config import load_sdm_exr_config
+
+        repo_root = Path(__file__).resolve().parents[1]
+        config = load_sdm_exr_config(
+            repo_root / "configs/lino_private_infer_trained_256_fixed.yaml"
+        )
+        self.assertEqual(config.preprocessing_version, "private_external_lino_256_v2")
+        self.assertEqual(config.max_image_resolution, 256)
+        self.assertTrue(config.require_checkpoint_data_contract)
+        self.assertIn("lino_private_256", str(config.checkpoint))
+        self.assertIn("lino_private_256", str(config.output_root))
+
     def test_external_and_full_are_the_only_mask_policies(self):
         external = self.load(mask_policy="external")
         full = self.load(mask_policy="full")

@@ -1,0 +1,28 @@
+# Paired inference preset for the comparable epoch-100 LINO-256 export.
+# Do not use this with a 512/256 checkpoint.
+
+checkpoint: "./runs/lino_private_256_fixed_lazy_sdmvalid_bf16/exports/lino_epoch_100.pth"
+data_root: "/mnt/18TData/minhnv/inference"
+output_root: "./output/lino_private_256_trained_lazy_sdmvalid"
+object_suffix: ".data"
+image_prefix: "image"
+image_extension: ".exr"
+max_image_num: 16
+light_selection: "manifest"
+selection_manifest: "./output/sdm_lino_comparison/external/selected_lights.json"
+seed: 20260710
+mask_policy: "external"
+external_mask_filename: "binary_mask.exr"
+normal_filenames: ["local_normal.exr"]
+normal_encoding: "unsigned"
+expected_source_geometry: [256, 256]
+mask_margin: 8
+max_image_resolution: 256
+pixel_samples: 2048
+precision: "bf16"
+device: "cuda"
+num_workers: 0
+save_exr: true
+save_png: false
+preprocessing_version: "private_external_lino_256_v2"
+require_checkpoint_data_contract: true

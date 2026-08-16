@@ -409,6 +409,32 @@ class SdmExrInferenceTests(unittest.TestCase):
             hashlib.sha256(config.checkpoint.with_suffix(".json").read_bytes()).hexdigest(),
         )
 
+    def test_trained_lino_256_route_validates_sidecar_and_builds_256_model_batch(self):
+        config = self._strict_private_fixture()
+        sidecar = config.checkpoint.with_suffix(".json")
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload["preprocessing_version"] = "private_external_lino_256_v2"
+        snapshot = payload["data_contract"]["config_snapshot"]
+        snapshot["preprocessing_version"] = "private_external_lino_256_v2"
+        snapshot["max_image_resolution"] = 256
+        snapshot["canonical_resolution"] = 128
+        sidecar.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        config = replace(
+            config,
+            preprocessing_version="private_external_lino_256_v2",
+            max_image_resolution=256,
+        )
+        calls = []
+
+        result = run_lino_inference(
+            config,
+            model_loader=lambda *_args: _PositiveZStub(calls),
+        )
+
+        self.assertEqual(result["preprocessing_version"], "private_external_lino_256_v2")
+        self.assertEqual(tuple(calls[0]["imgs"].shape), (1, 3, 256, 256, 16))
+        self.assertEqual(tuple(calls[0]["mask"].shape), (1, 1, 256, 256))
+
     def test_trained_route_accepts_manifest_when_training_deferred_selection(self):
         config = self._strict_private_fixture()
         sidecar = config.checkpoint.with_suffix(".json")
@@ -1331,6 +1357,45 @@ class SdmExrInferenceTests(unittest.TestCase):
                         inference.torch, "load", return_value={"weight": torch.ones(1)}
                     ):
                         load_local_lino_checkpoint(config, torch.device("cuda"))
+        self.assertTrue(captured["strict"])
+
+    def test_local_loader_constructs_lino_256_with_canonical_128(self):
+        captured = {}
+
+        class FakeLiNo:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def load_state_dict(self, _state_dict, strict):
+                captured["strict"] = strict
+                return types.SimpleNamespace(missing_keys=[], unexpected_keys=[])
+
+            def to(self, _device):
+                return self
+
+            def eval(self):
+                return self
+
+        selection = self.root / "strict-selection-256.json"
+        config = self._loader_config(
+            require_checkpoint_data_contract=True,
+            preprocessing_version="private_external_lino_256_v2",
+            max_image_num=16,
+            light_selection="manifest",
+            selection_manifest=selection,
+            normal_encoding="unsigned",
+            expected_source_geometry=(256, 256),
+            max_image_resolution=256,
+        )
+        with mock.patch.dict(sys.modules, self._fake_model_modules(FakeLiNo)):
+            with mock.patch.object(inference.torch.cuda, "is_available", return_value=True):
+                with mock.patch.object(
+                    inference.torch, "load", return_value={"weight": torch.ones(1)}
+                ):
+                    load_local_lino_checkpoint(config, torch.device("cuda"))
+
+        self.assertEqual(captured["model_resolution"], 256)
+        self.assertEqual(captured["canonical_resolution"], 128)
         self.assertTrue(captured["strict"])
 
     def test_malformed_prediction_shapes_and_nonfinite_values_fail(self):
