@@ -587,9 +587,15 @@ def _validate_rng_state(value: object, contract: Mapping[str, object] | None = N
             or state.dtype != torch.uint8
             or state.ndim != 1
             or state.numel() == 0
-            or state.numel() != expected_torch_bytes
         ):
-            raise ValueError(f"rng_state.cuda[{index}] has an invalid CPU uint8 state")
+            raise ValueError(f"rng_state.cuda[{index}] has an invalid serialized CUDA uint8 state")
+        if torch.cuda.is_available():
+            try:
+                torch.Generator(device=f"cuda:{index}").set_state(state.detach().clone())
+            except (RuntimeError, TypeError) as exc:
+                raise ValueError(
+                    f"rng_state.cuda[{index}] is not accepted by CUDA generator {index}"
+                ) from exc
 
 
 _REQUIRED_CONTRACT_KEYS = frozenset(

@@ -22,6 +22,7 @@ from src.training.checkpointing import (
     TrainingProgress,
     apply_artifact_retention,
     build_run_contract,
+    capture_rng_state,
     export_inference_weights,
     load_initial_weights,
     load_resume_checkpoint,
@@ -29,6 +30,7 @@ from src.training.checkpointing import (
     publish_epoch_artifacts,
     publish_tree_artifacts,
     save_resume_checkpoint,
+    _validate_rng_state,
     _validate_run_contract,
 )
 
@@ -331,7 +333,7 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
             {**valid["rng_state"], "python": (999, tuple(range(625)), None)},
             {**valid["rng_state"], "numpy": ("MT19937", np.zeros(1, dtype=np.uint32), 0, 0, 0.0)},
             {**valid["rng_state"], "torch": torch.zeros(1, dtype=torch.uint8)},
-            {**valid["rng_state"], "cuda": [torch.zeros(1, dtype=torch.uint8)]},
+            {**valid["rng_state"], "cuda": [torch.zeros(0, dtype=torch.uint8)]},
         )
         for index, rng_state in enumerate(invalid_states):
             with self.subTest(index=index):
@@ -345,6 +347,19 @@ class PrivateTrainingCheckpointTests(unittest.TestCase):
                         expected_schema=self.model,
                         expected_contract=self.contract,
                     )
+
+    def test_rng_validator_does_not_require_cuda_state_to_match_cpu_state_length(self) -> None:
+        state = capture_rng_state()
+        state["cuda"] = [torch.zeros(1, dtype=torch.uint8)]
+
+        with mock.patch("src.training.checkpointing.torch.cuda.is_available", return_value=False):
+            _validate_rng_state(state, {"cuda_device_count": 1})
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_rng_validator_accepts_captured_cuda_states(self) -> None:
+        state = capture_rng_state()
+
+        _validate_rng_state(state, {"cuda_device_count": len(state["cuda"])})
 
     def test_preflight_rejects_empty_partial_and_unknown_scheduler_state(self) -> None:
         checkpoint = self.root / "scheduler.ckpt"
